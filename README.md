@@ -16,7 +16,7 @@ Deux machines se partagent le travail :
 
 - **WordPress (hébergement mutualisé OVH)** — la vitrine : upload du modèle, interface,
   panier et paiement WooCommerce, suivi des commandes. Ne fait aucun calcul lourd.
-- **VPS (Debian 12, 4 vCœurs / 4 Go / 81 Go, Docker)** — le « cerveau de découpe » :
+- **VPS (Debian 12, 4 vCœurs / 4 Go / 80 Go, Docker)** — le « cerveau de découpe » :
   un service qui reçoit un STL, le passe au slicer (PrusaSlicer), et renvoie le poids
   de filament, le temps d'impression et les dimensions.
 
