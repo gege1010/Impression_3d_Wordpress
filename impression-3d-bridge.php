@@ -1,124 +1,394 @@
 <?php
 /*
 Plugin Name: Impression 3D - Pont Slicer
-Description: Relie WordPress au service de découpe (slicer) installé sur le VPS, pour calculer le prix d'impression côté serveur. Fonctionne aux côtés de 3DPrint Lite.
-Version: 0.1.0
+Description: Relie WordPress au service de découpe (slicer) du VPS et à WooCommerce. Calcule le prix côté serveur (poids + temps) et ajoute la commande au panier. Fonctionne aux côtés de 3DPrint Lite.
+Version: 0.3.0
 Author: gege1010
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 */
 
-// Sécurité : empêche d'ouvrir ce fichier directement dans le navigateur.
 if (!defined('ABSPATH')) {
     exit;
 }
 
-/**
- * Petit raccourci pour lire un réglage enregistré.
- * Tous nos réglages sont stockés ensemble dans une seule option "i3db_settings".
- */
+/* =====================================================================
+ *  RÉGLAGES
+ * ===================================================================== */
+
 function i3db_get($key, $default = '') {
     $o = get_option('i3db_settings', array());
     return isset($o[$key]) ? $o[$key] : $default;
 }
 
-/**
- * Ajoute une page "Pont Impression 3D" dans le menu Réglages de l'admin WordPress.
- */
-add_action('admin_menu', function () {
-    add_options_page(
-        'Pont Impression 3D',     // titre de la page
-        'Pont Impression 3D',     // libellé dans le menu
-        'manage_options',         // seul un administrateur y a accès
-        'i3db',                   // identifiant de la page
-        'i3db_render_page'        // fonction qui affiche la page
-    );
-});
+function i3db_set($key, $value) {
+    $o = get_option('i3db_settings', array());
+    $o[$key] = $value;
+    update_option('i3db_settings', $o);
+}
 
-/**
- * Affiche la page de réglages + le test de connexion.
- */
-function i3db_render_page() {
-    if (!current_user_can('manage_options')) {
-        return; // double sécurité
+/** Matériaux : lignes "cle|Nom|densité|prix_au_gramme". */
+function i3db_materials() {
+    $raw = i3db_get('materials', "pla|PLA|1.24|0.05\npetg|PETG|1.27|0.06");
+    $out = array();
+    foreach (explode("\n", $raw) as $line) {
+        $line = trim($line);
+        if ($line === '') continue;
+        $p = array_map('trim', explode('|', $line));
+        if (count($p) < 4) continue;
+        $out[$p[0]] = array('name' => $p[1], 'density' => floatval($p[2]), 'price_g' => floatval($p[3]));
+    }
+    return $out;
+}
+
+/** Prix horaire (€/h) par machine. */
+function i3db_machine_rate($printer) {
+    $map = array(
+        'a1'   => floatval(i3db_get('rate_a1', '1.5')),
+        'p1s'  => floatval(i3db_get('rate_p1s', '1.5')),
+        'v400' => floatval(i3db_get('rate_v400', '1.5')),
+    );
+    return isset($map[$printer]) ? $map[$printer] : 0.0;
+}
+
+/* =====================================================================
+ *  CORRESPONDANCES Lite -> nos clés
+ * ===================================================================== */
+
+/** Nom d'imprimante Lite -> clé slicer (a1 / p1s / v400). */
+function i3db_printer_key($name) {
+    $n = strtolower($name);
+    if (strpos($n, 'v400') !== false) return 'v400';
+    if (strpos($n, 'p1s')  !== false) return 'p1s';
+    if (strpos($n, 'a1')   !== false) return 'a1';
+    return '';
+}
+
+/** Nom de matériau Lite (ex. "PLA (1.75 mm) Green") -> notre clé matériau. */
+function i3db_material_key_from_name($lite_name) {
+    $ln = strtolower($lite_name);
+    foreach (i3db_materials() as $key => $m) {
+        if ($m['name'] !== '' && strpos($ln, strtolower($m['name'])) !== false) {
+            return $key;
+        }
+    }
+    return '';
+}
+
+/* =====================================================================
+ *  APPEL AU SLICER + CALCUL DU PRIX
+ * ===================================================================== */
+
+function i3db_call_slicer($stl_path, $fields) {
+    $base = rtrim(i3db_get('slicer_url', 'http://127.0.0.1:8099'), '/');
+    $key  = i3db_get('api_key', '');
+
+    $boundary = wp_generate_password(24, false);
+    $body = '';
+    foreach ($fields as $name => $value) {
+        $body .= "--$boundary\r\n";
+        $body .= "Content-Disposition: form-data; name=\"$name\"\r\n\r\n";
+        $body .= $value . "\r\n";
+    }
+    $body .= "--$boundary\r\n";
+    $body .= 'Content-Disposition: form-data; name="file"; filename="' . basename($stl_path) . "\"\r\n";
+    $body .= "Content-Type: application/octet-stream\r\n\r\n";
+    $body .= file_get_contents($stl_path) . "\r\n";
+    $body .= "--$boundary--\r\n";
+
+    $resp = wp_remote_post($base . '/slice', array(
+        'timeout' => 200,
+        'headers' => array('X-API-Key' => $key, 'Content-Type' => "multipart/form-data; boundary=$boundary"),
+        'body'    => $body,
+    ));
+
+    if (is_wp_error($resp)) return $resp;
+    $code = wp_remote_retrieve_response_code($resp);
+    $data = json_decode(wp_remote_retrieve_body($resp), true);
+    if ($code !== 200 || empty($data['ok'])) {
+        $msg = is_array($data) && isset($data['error']) ? $data['error'] : wp_remote_retrieve_body($resp);
+        return new WP_Error('slicer', 'Slicer (HTTP ' . intval($code) . ') : ' . $msg);
+    }
+    return $data;
+}
+
+/** Calcule un devis complet pour un fichier. Renvoie un tableau ou un WP_Error. */
+function i3db_quote($stl_path, $printer, $material_key, $infill, $supports, $scale) {
+    $materials = i3db_materials();
+    if (!isset($materials[$material_key])) {
+        return new WP_Error('material', 'Matériau inconnu : ' . $material_key);
+    }
+    $mat = $materials[$material_key];
+
+    $data = i3db_call_slicer($stl_path, array(
+        'printer'          => $printer,
+        'infill'           => (string)intval($infill),
+        'material_density' => $mat['density'],
+        'supports'         => $supports ? '1' : '0',
+        'scale'            => $scale,
+    ));
+    if (is_wp_error($data)) return $data;
+
+    $base_fee      = floatval(i3db_get('base_fee', '0'));
+    $cost_material = $data['weight_g'] * $mat['price_g'];
+    $cost_time     = $data['print_time_hours'] * i3db_machine_rate($printer);
+    $price         = $cost_material + $cost_time + $base_fee;
+
+    return array(
+        'price'         => round($price, 2),
+        'cost_material' => round($cost_material, 2),
+        'cost_time'     => round($cost_time, 2),
+        'base_fee'      => round($base_fee, 2),
+        'weight_g'      => $data['weight_g'],
+        'hours'         => $data['print_time_hours'],
+        'fits'          => $data['fits'],
+        'dimensions_mm' => $data['dimensions_mm'],
+        'material'      => $mat['name'],
+        'printer'       => $data['printer'],
+    );
+}
+
+/* =====================================================================
+ *  PRODUIT WOOCOMMERCE GÉNÉRIQUE (créé une fois, à la volée)
+ * ===================================================================== */
+
+function i3db_product_id() {
+    $id = (int) i3db_get('product_id', 0);
+    if ($id && function_exists('wc_get_product') && wc_get_product($id)) {
+        return $id;
+    }
+    if (!class_exists('WC_Product_Simple')) return 0;
+    $p = new WC_Product_Simple();
+    $p->set_name('Impression 3D sur mesure');
+    $p->set_status('publish');
+    $p->set_catalog_visibility('hidden');
+    $p->set_regular_price('0');
+    $p->set_sold_individually(false);
+    $id = $p->save();
+    i3db_set('product_id', $id);
+    return $id;
+}
+
+/* =====================================================================
+ *  INTERCEPTION DU FORMULAIRE -> CALCUL -> PANIER
+ * ===================================================================== */
+
+// On désactive le traitement "devis" de 3DPrint Lite quand c'est notre formulaire,
+// pour le remplacer par l'ajout au panier (évite l'e-mail de devis en double).
+add_action('init', function () {
+    if (!empty($_POST['action']) && $_POST['action'] === 'request_price') {
+        remove_action('init', 'p3dlite_request_price');
+    }
+}, 1);
+
+// Notre traitement, sur wp_loaded : à ce moment le panier WooCommerce est prêt.
+add_action('wp_loaded', 'i3db_process_to_cart', 99);
+function i3db_process_to_cart() {
+    if (empty($_POST['action']) || $_POST['action'] !== 'request_price') return;
+    if (empty($_POST['p3d_price_request']) || !wp_verify_nonce($_POST['p3d_price_request'], 'request')) return;
+    if (!function_exists('WC') || !WC()->cart) return;
+    if (!function_exists('p3dlite_get_option')) return;
+
+    // Choix du client
+    $printer_id  = isset($_POST['attribute_pa_p3dlite_printer'])  ? (int) $_POST['attribute_pa_p3dlite_printer']  : 0;
+    $material_id = isset($_POST['attribute_pa_p3dlite_material']) ? (int) $_POST['attribute_pa_p3dlite_material'] : 0;
+    $infill_id   = isset($_POST['attribute_pa_p3dlite_infill'])   ? (int) $_POST['attribute_pa_p3dlite_infill']   : 0;
+    $model_file  = isset($_POST['attribute_pa_p3dlite_model'])    ? basename(sanitize_file_name($_POST['attribute_pa_p3dlite_model'])) : '';
+    $quantity    = isset($_POST['p3dlite_quantity']) ? max(1, (int) $_POST['p3dlite_quantity']) : 1;
+
+    // Résolution des noms via les tables de 3DPrint Lite
+    $printers  = p3dlite_get_option('p3dlite_printers');
+    $materials = p3dlite_get_option('p3dlite_materials');
+    $infills   = p3dlite_get_option('p3dlite_infills');
+
+    $printer_name  = isset($printers[$printer_id]['name'])   ? $printers[$printer_id]['name']   : '';
+    $material_name = isset($materials[$material_id]['name'])  ? $materials[$material_id]['name'] : '';
+    $infill_pct    = isset($infills[$infill_id]['infill'])    ? (int) round($infills[$infill_id]['infill']) : 100;
+
+    $machine_key  = i3db_printer_key($printer_name);
+    $material_key = i3db_material_key_from_name($material_name);
+
+    // Fichier déposé par 3DPrint Lite
+    $upload = wp_upload_dir();
+    $stl_path = $upload['basedir'] . '/p3d/' . $model_file;
+
+    if (!$machine_key || !$material_key || $model_file === '' || !file_exists($stl_path)) {
+        i3db_cart_error('Impossible de retrouver la machine, le matériau ou le fichier. Vérifie les noms côté 3DPrint Lite.');
+        return;
     }
 
-    $notice = '';
-    $test_result = '';
+    // Calcul (échelle = 1 pour l'instant)
+    $q = i3db_quote($stl_path, $machine_key, $material_key, $infill_pct, false, 1);
+    if (is_wp_error($q)) { i3db_cart_error($q->get_error_message()); return; }
+    if (empty($q['fits'])) { i3db_cart_error('Le modèle ne rentre pas dans la machine choisie (' . $printer_name . ').'); return; }
+    if ($q['price'] <= 0)  { i3db_cart_error('Prix calculé nul, vérifie tes tarifs.'); return; }
 
-    // --- 1) Enregistrement des réglages -----------------------------------
+    $pid = i3db_product_id();
+    if (!$pid) { i3db_cart_error('Produit WooCommerce introuvable.'); return; }
+
+    // Ajout au panier avec toutes les infos rattachées
+    WC()->cart->add_to_cart($pid, $quantity, 0, array(), array('i3db' => array(
+        'price'    => $q['price'],
+        'model'    => $model_file,
+        'printer'  => $printer_name,
+        'material' => $material_name,
+        'infill'   => $infill_pct,
+        'weight'   => $q['weight_g'],
+        'hours'    => $q['hours'],
+        'dim'      => $q['dimensions_mm'],
+        'unique'   => md5($model_file . $machine_key . $material_key . $infill_pct . microtime(true)),
+    )));
+
+    wp_safe_redirect(wc_get_cart_url());
+    exit;
+}
+
+/** Affiche une erreur sur la page panier et y redirige. */
+function i3db_cart_error($msg) {
+    if (function_exists('wc_add_notice')) {
+        wc_add_notice('Devis impression 3D : ' . $msg, 'error');
+    }
+    wp_safe_redirect(wc_get_cart_url());
+    exit;
+}
+
+/* =====================================================================
+ *  PRIX PERSONNALISÉ + AFFICHAGE DES INFOS DANS LE PANIER / LA COMMANDE
+ * ===================================================================== */
+
+// Applique notre prix calculé à chaque ligne concernée.
+add_action('woocommerce_before_calculate_totals', function ($cart) {
+    if (is_admin() && !defined('DOING_AJAX')) return;
+    foreach ($cart->get_cart() as $item) {
+        if (!empty($item['i3db']['price']) && isset($item['data'])) {
+            $item['data']->set_price((float) $item['i3db']['price']);
+        }
+    }
+}, 20, 1);
+
+// Montre les caractéristiques dans le panier.
+add_filter('woocommerce_get_item_data', function ($data, $cart_item) {
+    if (!empty($cart_item['i3db'])) {
+        $d = $cart_item['i3db'];
+        $data[] = array('name' => 'Machine',      'value' => $d['printer']);
+        $data[] = array('name' => 'Matériau',     'value' => $d['material']);
+        $data[] = array('name' => 'Remplissage',  'value' => $d['infill'] . ' %');
+        $data[] = array('name' => 'Poids estimé', 'value' => $d['weight'] . ' g');
+        $data[] = array('name' => 'Fichier',      'value' => $d['model']);
+    }
+    return $data;
+}, 10, 2);
+
+// Enregistre les caractéristiques dans la commande (visible côté admin).
+add_action('woocommerce_checkout_create_order_line_item', function ($item, $cart_item_key, $values, $order) {
+    if (!empty($values['i3db'])) {
+        $d = $values['i3db'];
+        $item->add_meta_data('Machine', $d['printer']);
+        $item->add_meta_data('Matériau', $d['material']);
+        $item->add_meta_data('Remplissage', $d['infill'] . ' %');
+        $item->add_meta_data('Poids estimé', $d['weight'] . ' g');
+        $item->add_meta_data('Temps estimé', $d['hours'] . ' h');
+        $item->add_meta_data('Fichier', $d['model']);
+    }
+}, 10, 4);
+
+// Déclare la compatibilité avec le stockage de commandes HPOS de WooCommerce.
+add_action('before_woocommerce_init', function () {
+    if (class_exists('\Automattic\WooCommerce\Utilities\FeaturesUtil')) {
+        \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility('custom_order_tables', __FILE__, true);
+    }
+});
+
+/* =====================================================================
+ *  PAGE D'ADMINISTRATION (réglages + tests)
+ * ===================================================================== */
+
+add_action('admin_menu', function () {
+    add_options_page('Pont Impression 3D', 'Pont Impression 3D', 'manage_options', 'i3db', 'i3db_render_page');
+});
+
+function i3db_render_page() {
+    if (!current_user_can('manage_options')) return;
+
+    $notice = ''; $test_conn = ''; $quote_out = '';
+
     if (isset($_POST['i3db_save']) && check_admin_referer('i3db_save_action')) {
-        $settings = array(
-            'slicer_url' => esc_url_raw(trim($_POST['slicer_url'])),
-            'api_key'    => sanitize_text_field($_POST['api_key']),
-        );
-        update_option('i3db_settings', $settings);
+        $o = get_option('i3db_settings', array());
+        $o['slicer_url'] = esc_url_raw(trim($_POST['slicer_url']));
+        $o['api_key']    = sanitize_text_field($_POST['api_key']);
+        $o['materials']  = sanitize_textarea_field($_POST['materials']);
+        $o['base_fee']   = sanitize_text_field($_POST['base_fee']);
+        $o['rate_a1']    = sanitize_text_field($_POST['rate_a1']);
+        $o['rate_p1s']   = sanitize_text_field($_POST['rate_p1s']);
+        $o['rate_v400']  = sanitize_text_field($_POST['rate_v400']);
+        update_option('i3db_settings', $o);
         $notice = 'Réglages enregistrés.';
     }
 
-    // --- 2) Test de connexion au slicer -----------------------------------
     if (isset($_POST['i3db_test']) && check_admin_referer('i3db_test_action')) {
-        // On interroge la page /health du service (la plus simple, sans fichier).
         $base = rtrim(i3db_get('slicer_url', 'http://127.0.0.1:8099'), '/');
         $resp = wp_remote_get($base . '/health', array('timeout' => 10));
+        $test_conn = is_wp_error($resp)
+            ? 'ÉCHEC : ' . esc_html($resp->get_error_message())
+            : 'Réponse HTTP ' . intval(wp_remote_retrieve_response_code($resp)) . ' : ' . esc_html(wp_remote_retrieve_body($resp));
+    }
 
-        if (is_wp_error($resp)) {
-            // WordPress n'a pas réussi à joindre le service.
-            $test_result = "ÉCHEC : " . esc_html($resp->get_error_message());
+    if (isset($_POST['i3db_quote']) && check_admin_referer('i3db_quote_action') && !empty($_FILES['test_stl']['tmp_name'])) {
+        $q = i3db_quote($_FILES['test_stl']['tmp_name'], sanitize_text_field($_POST['t_printer']),
+            sanitize_text_field($_POST['t_material']), sanitize_text_field($_POST['t_infill']),
+            !empty($_POST['t_supports']), sanitize_text_field($_POST['t_scale']));
+        if (is_wp_error($q)) {
+            $quote_out = 'ERREUR : ' . esc_html($q->get_error_message());
         } else {
-            $code = wp_remote_retrieve_response_code($resp);
-            $body = wp_remote_retrieve_body($resp);
-            $test_result = "Réponse HTTP " . intval($code) . " : " . esc_html($body);
+            $dim = implode(' × ', array_map('floatval', $q['dimensions_mm']));
+            $quote_out = 'Matériau : ' . esc_html($q['material']) . ' sur ' . esc_html($q['printer']) . "\n"
+                . 'Dimensions : ' . esc_html($dim) . " mm  (rentre : " . ($q['fits'] ? 'oui' : 'NON') . ")\n"
+                . 'Poids : ' . esc_html($q['weight_g']) . " g\nTemps : " . esc_html($q['hours']) . " h\n---\n"
+                . 'Coût matière : ' . esc_html($q['cost_material']) . " €\nCoût temps   : " . esc_html($q['cost_time']) . " €\n"
+                . 'Forfait      : ' . esc_html($q['base_fee']) . " €\nPRIX TOTAL   : " . esc_html($q['price']) . " €";
         }
     }
 
-    // Valeurs actuelles (avec des valeurs par défaut pratiques).
     $slicer_url = i3db_get('slicer_url', 'http://127.0.0.1:8099');
     $api_key    = i3db_get('api_key', '');
+    $materials  = i3db_get('materials', "pla|PLA|1.24|0.05\npetg|PETG|1.27|0.06");
+    $base_fee   = i3db_get('base_fee', '0');
+    $mats       = i3db_materials();
     ?>
     <div class="wrap">
         <h1>Pont Impression 3D</h1>
-
-        <?php if ($notice): ?>
-            <div class="notice notice-success"><p><?php echo esc_html($notice); ?></p></div>
-        <?php endif; ?>
-
+        <?php if ($notice): ?><div class="notice notice-success"><p><?php echo esc_html($notice); ?></p></div><?php endif; ?>
         <h2>Réglages</h2>
         <form method="post">
             <?php wp_nonce_field('i3db_save_action'); ?>
             <table class="form-table">
-                <tr>
-                    <th><label for="slicer_url">Adresse du slicer</label></th>
-                    <td>
-                        <input type="text" id="slicer_url" name="slicer_url"
-                               value="<?php echo esc_attr($slicer_url); ?>" size="40" class="regular-text">
-                        <p class="description">Sur la même machine, laisse <code>http://127.0.0.1:8099</code>.</p>
-                    </td>
-                </tr>
-                <tr>
-                    <th><label for="api_key">Clé secrète</label></th>
-                    <td>
-                        <input type="text" id="api_key" name="api_key"
-                               value="<?php echo esc_attr($api_key); ?>" size="40" class="regular-text">
-                        <p class="description">La même clé que celle donnée au lancement du conteneur (SLICER_API_KEY).</p>
-                    </td>
-                </tr>
+                <tr><th>Adresse du slicer</th><td><input type="text" name="slicer_url" value="<?php echo esc_attr($slicer_url); ?>" class="regular-text"><p class="description">Même machine : <code>http://127.0.0.1:8099</code></p></td></tr>
+                <tr><th>Clé secrète</th><td><input type="text" name="api_key" value="<?php echo esc_attr($api_key); ?>" class="regular-text"></td></tr>
+                <tr><th>Matériaux</th><td><textarea name="materials" rows="4" class="large-text" style="font-family:monospace"><?php echo esc_textarea($materials); ?></textarea><p class="description"><code>cle|Nom|densité|prix_au_gramme</code> (le Nom doit se retrouver dans le nom du matériau côté 3DPrint Lite)</p></td></tr>
+                <tr><th>Prix horaire (€/h)</th><td>A1 : <input type="text" name="rate_a1" value="<?php echo esc_attr(i3db_get('rate_a1','1.5')); ?>" size="6"> P1S : <input type="text" name="rate_p1s" value="<?php echo esc_attr(i3db_get('rate_p1s','1.5')); ?>" size="6"> V400 : <input type="text" name="rate_v400" value="<?php echo esc_attr(i3db_get('rate_v400','1.5')); ?>" size="6"></td></tr>
+                <tr><th>Forfait de base (€)</th><td><input type="text" name="base_fee" value="<?php echo esc_attr($base_fee); ?>" size="6"></td></tr>
             </table>
             <p><button type="submit" name="i3db_save" class="button button-primary">Enregistrer</button></p>
         </form>
-
         <hr>
-
         <h2>Test de connexion</h2>
-        <p>Vérifie que WordPress arrive à joindre le service de découpe.</p>
-        <form method="post">
-            <?php wp_nonce_field('i3db_test_action'); ?>
-            <p><button type="submit" name="i3db_test" class="button">Tester la connexion</button></p>
+        <form method="post"><?php wp_nonce_field('i3db_test_action'); ?><p><button type="submit" name="i3db_test" class="button">Tester la connexion</button></p></form>
+        <?php if ($test_conn): ?><div class="notice notice-info"><p><strong>Résultat :</strong> <?php echo $test_conn; ?></p></div><?php endif; ?>
+        <hr>
+        <h2>Test de devis</h2>
+        <form method="post" enctype="multipart/form-data">
+            <?php wp_nonce_field('i3db_quote_action'); ?>
+            <table class="form-table">
+                <tr><th>Fichier STL</th><td><input type="file" name="test_stl" accept=".stl" required></td></tr>
+                <tr><th>Machine</th><td><select name="t_printer"><option value="a1">Bambu Lab A1</option><option value="p1s">Bambu Lab P1S</option><option value="v400">FLSUN V400</option></select></td></tr>
+                <tr><th>Matériau</th><td><select name="t_material"><?php foreach ($mats as $k => $m): ?><option value="<?php echo esc_attr($k); ?>"><?php echo esc_html($m['name']); ?></option><?php endforeach; ?></select></td></tr>
+                <tr><th>Remplissage (%)</th><td><input type="text" name="t_infill" value="20" size="4"></td></tr>
+                <tr><th>Échelle</th><td><input type="text" name="t_scale" value="1" size="4"></td></tr>
+                <tr><th>Supports</th><td><label><input type="checkbox" name="t_supports" value="1"> activer</label></td></tr>
+            </table>
+            <p><button type="submit" name="i3db_quote" class="button">Calculer le devis</button></p>
         </form>
-
-        <?php if ($test_result): ?>
-            <div class="notice notice-info"><p><strong>Résultat :</strong> <?php echo $test_result; ?></p></div>
-        <?php endif; ?>
+        <?php if ($quote_out): ?><div class="notice notice-info"><pre style="white-space:pre-wrap;margin:0"><?php echo esc_html($quote_out); ?></pre></div><?php endif; ?>
     </div>
     <?php
 }
