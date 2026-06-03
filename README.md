@@ -3,103 +3,107 @@
 Projet : permettre à un client d'uploader un fichier STL sur le site, d'obtenir une
 **estimation de prix automatique** pour son impression 3D, de payer en ligne
 (WooCommerce), et que la commande arrive côté administration. Le prix repose sur le
-**poids de filament** et le **temps d'impression**.
+**poids de filament** et le **temps d'impression** (supports inclus si activés).
 
-Ce document sert de mémoire du projet : il décrit l'architecture, ce qui est déjà fait,
-et ce qu'il reste à faire, pour pouvoir reprendre à tout moment.
+Ce document sert de mémoire du projet : architecture, ce qui est fait, ce qu'il reste.
 
 ---
 
 ## Architecture
 
-Deux machines se partagent le travail :
-
 - **WordPress (hébergement mutualisé OVH)** — la vitrine : upload du modèle, interface,
   panier et paiement WooCommerce, suivi des commandes. Ne fait aucun calcul lourd.
-- **VPS (Debian 12, 4 vCœurs / 4 Go / 80 Go, Docker)** — le « cerveau de découpe » :
-  un service qui reçoit un STL, le passe au slicer (PrusaSlicer), et renvoie le poids
-  de filament, le temps d'impression et les dimensions.
+- **VPS (Debian 12, 4 vCœurs / 4 Go / 81 Go, Docker)** — le "cerveau de découpe" :
+  un service web qui reçoit un STL + paramètres et renvoie poids, temps, dimensions,
+  et si la pièce rentre dans la machine.
 
 WordPress interroge le VPS, applique la tarification, et met **ce prix calculé côté
-serveur** dans le panier. Le prix n'est jamais pris depuis le navigateur du client
-(c'est la faille du montage gratuit existant : le prix venait du client et était cru
-aveuglément, donc falsifiable).
+serveur** dans le panier. Le prix n'est jamais pris depuis le navigateur du client.
 
-Pourquoi auto-héberger le slicer plutôt que d'acheter la version premium de 3DPrint :
-le premium recalcule bien le prix côté serveur (bon point), mais ses fonctions
-avancées (temps d'impression, remplissage) passent par une API limitée à 30 appels
-gratuits/mois — un visiteur mal intentionné pourrait épuiser le quota. En hébergeant
-nous-mêmes, pas de limite et pas de dépendance.
+Pourquoi auto-héberger : pas de limite d'appels (contrairement à l'API du premium,
+limitée à 30 devis/mois) et aucune dépendance externe.
 
-## Machines (profils à intégrer dans le slicer)
+## Machines
 
-| Machine          | Type      | Volume utile                         | Buse  |
-|------------------|-----------|--------------------------------------|-------|
-| Bambu Lab A1     | FDM       | 256 × 256 × 256 mm (boîte)           | 0,4mm |
-| Bambu Lab P1S    | FDM       | 256 × 256 × 256 mm (boîte)           | 0,4mm |
-| FLSUN V400       | FDM delta | cylindre Ø300 × 410 mm               | 0,4mm |
+| Machine          | Type      | Volume utile               | Buse  |
+|------------------|-----------|----------------------------|-------|
+| Bambu Lab A1     | FDM       | 256 × 256 × 256 mm (boîte) | 0,4mm |
+| Bambu Lab P1S    | FDM       | 256 × 256 × 256 mm (boîte) | 0,4mm |
+| FLSUN V400       | FDM delta | cylindre Ø300 × 410 mm     | 0,4mm |
 
-Note FLSUN V400 (delta) : pour une pièce carrée, emprise utile ~205 × 205 mm, hauteur
-exploitable ~390 mm. Le contrôle « est-ce que la pièce rentre » se fait dans une boîte
-pour les Bambu, dans un cylindre pour la delta.
+Contrôle "ça rentre" : boîte pour les Bambu, cylindre pour la FLSUN (delta).
 
 ## Tarification
 
-prix = (poids_filament_g × prix_au_gramme_du_matériau)
-     + (heures_impression × prix_horaire_de_la_machine)
-     + forfait_de_base
-Le poids est exact (géométrie × densité). Le temps PrusaSlicer doit être calibré pour
-les Bambu (mécanique rapide) : comparer l'estimation à de vraies impressions et ajuster
-les vitesses du profil, ou appliquer un coefficient correcteur par machine.
+    prix = (poids_g × prix_au_gramme_du_materiau)
+         + (heures × prix_horaire_de_la_machine)
+         + forfait_de_base
+
+Poids exact (géométrie × densité). Temps PrusaSlicer à calibrer pour les Bambu via le
+`time_factor` de chaque machine (dans app.py) : comparer à de vraies impressions.
 
 ---
 
 ## Avancement
 
-- [x] VPS Debian 12, accès root (via console / terminal SSH Plesk).
-- [x] Docker installé et fonctionnel sur le VPS.
-- [x] Image Docker `slicer` avec PrusaSlicer (paquet Debian `prusa-slicer`).
-- [x] Découpe validée : un STL en entrée → poids (g) + temps d'impression en sortie.
-- [ ] Profils des 3 machines (vitesses réelles) pour des temps justes.
-- [ ] Contrôle « la pièce rentre » (boîte / cylindre selon machine).
-- [ ] Service de découpe sur le VPS (reçoit STL + paramètres, renvoie JSON,
-      protégé par clé secrète, HTTPS, limite de débit anti-abus, timeout par découpe).
-- [ ] Intégration WordPress : prix recalculé côté serveur → panier WooCommerce.
-- [ ] Interface front (upload + aperçu 3D + choix machine) — réutiliser 3DPrint Lite
-      (GPLv2, garder l'attribution) ou refaire.
+- [x] VPS Debian 12, accès root (terminal SSH via Plesk).
+- [x] Docker installé et fonctionnel.
+- [x] Image Docker du slicer (PrusaSlicer, paquet Debian `prusa-slicer`).
+- [x] Découpe validée : STL -> poids + temps.
+- [x] **Service de découpe (slicer API)** opérationnel sur le VPS :
+      reçoit STL + paramètres, renvoie JSON (poids, temps, dimensions, fits).
+      Protégé par clé secrète, limite anti-abus, délai max par découpe.
+- [x] Contrôle "la pièce rentre" (boîte / cylindre) intégré au service.
+- [x] Options remplissage (infill) et supports prises en charge par le service.
+- [ ] Exposer le service en HTTPS (adresse + certificat) pour que WordPress l'atteigne.
+- [ ] Redémarrage automatique du conteneur au reboot du VPS (--restart).
+- [ ] Profils fins par machine (vitesses) + calibration du temps (time_factor).
+- [ ] Pont WordPress : prix recalculé côté serveur -> panier WooCommerce.
+- [ ] Interface front : réutiliser 3DPrint Lite 2.1.4 (upload + viewer + choix machine).
 
-## Utilisation du slicer (état actuel)
+## Le service de découpe (slicer API)
 
-Voir le dossier `slicer/`.
+Fichiers : `Dockerfile` + `app.py`.
 
-Construire l'image :
+Construire et lancer (la CLE doit rester secrète ; WordPress l'utilisera) :
 
-    cd slicer
-    docker build -t slicer .
+    cd ~/slicer
+    docker build -t slicer-api .
+    docker run -d --name slicer-api -p 127.0.0.1:8099:8099 \
+      -e SLICER_API_KEY=ta-cle-secrete slicer-api
 
-Découper un modèle (exemple avec le cube de test) :
+Points d'entrée :
+- `GET  /health` — vérifie que le service répond.
+- `POST /slice`  — en-tête `X-API-Key: ta-cle-secrete`, et en formulaire :
+  `file` (le .stl), `printer` (a1 / p1s / v400), `infill` (ex. 20),
+  `material_density` (ex. 1.24), `supports` (0/1), `scale` (ex. 1).
 
-    docker run --rm -v "$PWD":/work slicer \
-      --export-gcode /work/cube.stl --output /work/cube.gcode \
-      --nozzle-diameter 0.4 --layer-height 0.2 --first-layer-height 0.2 \
-      --filament-diameter 1.75 --temperature 210 --bed-temperature 60 \
-      --fill-density 20% --perimeters 2 --top-solid-layers 4 \
-      --bottom-solid-layers 4 --skirts 1 --filament-density 1.24
+Exemple de test :
 
-Lire le résultat dans le G-code généré :
+    curl -s -H "X-API-Key: ta-cle-secrete" \
+      -F "file=@cube.stl" -F "printer=a1" -F "infill=20" -F "material_density=1.24" \
+      http://127.0.0.1:8099/slice
 
-    grep -iE "filament used \[g\]|estimated printing time" cube.gcode
+Réponse (JSON) : ok, printer, weight_g, print_time_seconds, print_time_hours,
+dimensions_mm, volume_cm3, fits, infill_percent, supports.
 
-## Notes de sécurité (pour la suite)
+## Notes de sécurité
 
-- Le prix est TOUJOURS recalculé côté serveur ; le chiffre venu du navigateur ne sert
-  qu'à l'affichage.
-- Le service de découpe n'est joignable que par WordPress (clé secrète), en HTTPS.
-- La découpe tourne dans Docker (isolation), avec une taille de fichier max et un
-  délai limite par découpe.
-- Limite de débit (ex. X devis / visiteur / heure) pour éviter l'abus.
+- Prix TOUJOURS recalculé côté serveur ; le chiffre du navigateur ne sert qu'à l'affichage.
+- Service joignable uniquement par WordPress (clé secrète), bientôt en HTTPS.
+- Découpe isolée dans Docker, taille de fichier max (60 Mo) et délai limite (180 s).
+- Limite de débit anti-abus par adresse IP.
+
+## Notes 3DPrint Lite 2.1.4 (analyse)
+
+- Version récente (testée jusqu'à WordPress 7.0), propre sous PHP 8.3.
+- Le prix y est encore calculé côté navigateur (faille) -> on le remplace par notre service.
+- Pas d'intégration WooCommerce dans la version Lite (réservé au premium) -> on fait le pont.
+- Le remplissage (infill) et le contrôle de taille existent déjà côté Lite.
+- Viewer 3D en Three.js r101 (2018) : vieux mais fonctionnel ; modernisation optionnelle, plus tard.
 
 ## Licence
 
-Si on réutilise 3DPrint Lite pour le front (moteur sous GPLv2), conserver les fichiers
-de licence et les mentions d'auteur d'origine (Sergey Burkov / wp3dprinting.com).
+Notre code : GPLv2-ou-ultérieure (standard WordPress). Si on réutilise 3DPrint Lite,
+ne PAS copier son code dans ce dépôt — l'installer séparément. Pour un usage privé/perso,
+toute modification reste permise ; garder l'attribution si jamais on distribue.
