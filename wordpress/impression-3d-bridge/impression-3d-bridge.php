@@ -2,7 +2,7 @@
 /*
 Plugin Name: Impression 3D - Pont Slicer
 Description: Relie WordPress au service de découpe (slicer) du VPS et à WooCommerce. Calcule le prix côté serveur (poids + temps) et ajoute la commande au panier. Fonctionne aux côtés de 3DPrint Lite.
-Version: 0.3.0
+Version: 0.4.0
 Author: gege1010
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -217,8 +217,11 @@ function i3db_process_to_cart() {
         return;
     }
 
+    // Supports demandés par le client (case ajoutée par notre pont)
+    $supports = !empty($_POST['i3db_supports']);
+
     // Calcul (échelle = 1 pour l'instant)
-    $q = i3db_quote($stl_path, $machine_key, $material_key, $infill_pct, false, 1);
+    $q = i3db_quote($stl_path, $machine_key, $material_key, $infill_pct, $supports, 1);
     if (is_wp_error($q)) { i3db_cart_error($q->get_error_message()); return; }
     if (empty($q['fits'])) { i3db_cart_error('Le modèle ne rentre pas dans la machine choisie (' . $printer_name . ').'); return; }
     if ($q['price'] <= 0)  { i3db_cart_error('Prix calculé nul, vérifie tes tarifs.'); return; }
@@ -392,3 +395,53 @@ function i3db_render_page() {
     </div>
     <?php
 }
+
+
+/* =====================================================================
+ *  PERSONNALISATION DU FORMULAIRE CLIENT (sans modifier 3DPrint Lite)
+ * ===================================================================== */
+
+// Renomme le bouton "Request a Quote" -> "Ajouter au panier".
+add_filter('gettext', function ($translated, $text, $domain) {
+    if ($domain === '3dprint-lite') {
+        if ($text === 'Request a Quote') return 'Ajouter au panier';
+        if ($text === 'Estimated Price:') return 'Prix estime :';
+    }
+    return $translated;
+}, 20, 3);
+
+// Case "supports", masquage e-mail/commentaire, et style propre.
+add_action('wp_footer', function () {
+    ?>
+    <style>
+    form.p3dlite_form .price-request-field { display:block; width:100%; max-width:340px; margin:8px 0; padding:10px 12px; border:1px solid #d9d9d9; border-radius:8px; box-sizing:border-box; }
+    form.p3dlite_form input[name="p3dlite_email_address"],
+    form.p3dlite_form input[name="p3dlite_request_comment"] { display:none !important; }
+    form.p3dlite_form .i3db-supports { display:flex; align-items:center; gap:8px; margin:14px 0; font-size:15px; cursor:pointer; }
+    form.p3dlite_form button[type="submit"].button.alt { float:none !important; width:100%; max-width:340px; padding:14px 18px; font-size:16px; font-weight:600; border:0; border-radius:10px; cursor:pointer; }
+    </style>
+    <script>
+    (function () {
+        var tries = 0;
+        var iv = setInterval(function () {
+            var form = document.querySelector('form.p3dlite_form');
+            var btn  = form ? form.querySelector('button[type="submit"]') : null;
+            if (form && btn) {
+                clearInterval(iv);
+                // Pré-remplit l'e-mail (masqué) pour ne pas bloquer l'envoi, puis on l'ignore côté serveur.
+                var em = form.querySelector('[name="p3dlite_email_address"]');
+                if (em && !em.value) em.value = 'panier@impression3d.local';
+                // Ajoute la case supports juste avant le bouton.
+                if (!form.querySelector('[name="i3db_supports"]')) {
+                    var lbl = document.createElement('label');
+                    lbl.className = 'i3db-supports';
+                    lbl.innerHTML = '<input type="checkbox" name="i3db_supports" value="1"> <span>Ajouter des supports d\'impression (si la piece en a besoin)</span>';
+                    btn.parentNode.insertBefore(lbl, btn);
+                }
+            }
+            if (++tries > 40) clearInterval(iv);
+        }, 250);
+    })();
+    </script>
+    <?php
+});
