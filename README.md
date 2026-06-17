@@ -65,11 +65,17 @@ Poids exact (géométrie × densité). Temps PrusaSlicer à calibrer pour les Ba
 ## Reste à affiner (améliorations, non bloquantes)
 
 - [ ] Gestion de l'échelle (scale) si le client redimensionne (actuellement figé à 1).
-- [ ] Case à cocher "supports" sur le formulaire client.
+- [x] Case à cocher "supports" sur le formulaire client (pont v0.4).
+- [x] Bouton renommé "Ajouter au panier", champs e-mail/commentaire masqués, style épuré (pont v0.4).
 - [ ] Aligner le prix AFFICHÉ sur le formulaire Lite avec le prix réel (panier).
 - [ ] Calibrer le temps des Bambu (time_factor) avec de vraies impressions.
 - [ ] Tester un vrai paiement (tunnel WooCommerce de bout en bout).
 - [ ] Option : fusionner les deux plugins en un seul (finition, plus tard).
+
+## Versions
+
+- Pont WordPress (plugin maison `impression-3d-bridge`) : **v0.4.0**.
+- Service slicer (`app.py`) : 205 lignes.
 
 ## Le service de découpe (slicer API)
 
