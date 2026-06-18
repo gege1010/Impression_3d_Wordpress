@@ -13,7 +13,7 @@ Ce document sert de mémoire du projet : architecture, ce qui est fait, ce qu'il
 
 - **WordPress (hébergement mutualisé OVH)** — la vitrine : upload du modèle, interface,
   panier et paiement WooCommerce, suivi des commandes. Ne fait aucun calcul lourd.
-- **VPS (Debian 12, 4 vCœurs / 4 Go / 81 Go, Docker)** — le "cerveau de découpe" :
+- **VPS (Debian 12, 4 vCœurs / 4 Go / 80 Go, Docker)** — le "cerveau de découpe" :
   un service web qui reçoit un STL + paramètres et renvoie poids, temps, dimensions,
   et si la pièce rentre dans la machine.
 
@@ -67,6 +67,7 @@ Poids exact (géométrie × densité). Temps PrusaSlicer à calibrer pour les Ba
 - [ ] Gestion de l'échelle (scale) si le client redimensionne (actuellement figé à 1).
 - [x] Case à cocher "supports" sur le formulaire client (pont v0.4).
 - [x] Bouton renommé "Ajouter au panier", champs e-mail/commentaire masqués, style épuré (pont v0.4).
+- [x] Détection automatique des supports : analyse géométrique des surplombs (endpoint /analyze), message + case cochée auto sur le formulaire (pont v0.5).
 - [ ] Aligner le prix AFFICHÉ sur le formulaire Lite avec le prix réel (panier).
 - [ ] Calibrer le temps des Bambu (time_factor) avec de vraies impressions.
 - [ ] Tester un vrai paiement (tunnel WooCommerce de bout en bout).
@@ -74,8 +75,8 @@ Poids exact (géométrie × densité). Temps PrusaSlicer à calibrer pour les Ba
 
 ## Versions
 
-- Pont WordPress (plugin maison `impression-3d-bridge`) : **v0.4.0**.
-- Service slicer (`app.py`) : 205 lignes.
+- Pont WordPress (plugin maison `impression-3d-bridge`) : **v0.5.0**.
+- Service slicer (`app.py`) : endpoints /health, /slice, /analyze (détection des supports). Nécessite numpy.
 
 ## Le service de découpe (slicer API)
 
