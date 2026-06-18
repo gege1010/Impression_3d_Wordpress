@@ -1,6 +1,6 @@
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      prusa-slicer python3 python3-flask gunicorn ca-certificates \
+      prusa-slicer python3 python3-flask python3-numpy gunicorn ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY app.py /app/app.py

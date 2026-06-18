@@ -17,8 +17,10 @@ import os
 import re
 import time
 import math
+import struct
 import tempfile
 import subprocess
+import numpy as np
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -198,6 +200,95 @@ def slice_model():
         infill_percent=infill,
         supports=supports,
     )
+
+
+# --- Détection des supports (analyse géométrique des surplombs) ------------
+# On regarde l'orientation de chaque facette. Une facette qui "regarde vers le
+# bas" de façon prononcée ET qui n'est pas posée sur le plateau = un surplomb
+# qui aurait besoin de support. Si la surface en surplomb dépasse un certain
+# pourcentage de la surface totale, on recommande les supports.
+# (Indication approximative, le client peut toujours ajuster la case.)
+OVERHANG_NZ = float(os.environ.get("OVERHANG_NZ", "-0.6"))          # normale plus basse que ça = surplomb
+BED_EPS = float(os.environ.get("BED_EPS", "0.5"))                   # mm au-dessus du plateau (on ignore la face du dessous)
+OVERHANG_FRACTION = float(os.environ.get("OVERHANG_FRACTION", "0.02"))  # > 2% de surface en surplomb -> supports
+
+
+def _load_stl_triangles(path):
+    """Charge un STL (binaire ou ASCII) -> tableau numpy (N, 3, 3) des sommets."""
+    with open(path, "rb") as f:
+        head = f.read(80)
+    is_ascii = head[:5].lower() == b"solid"
+    if is_ascii:
+        with open(path, "rb") as f:
+            if b"facet" not in f.read(1024).lower():
+                is_ascii = False  # certains binaires commencent par "solid"
+    if not is_ascii:
+        with open(path, "rb") as f:
+            f.read(80)
+            (n,) = struct.unpack("<I", f.read(4))
+            data = f.read(50 * n)
+        dt = np.dtype([("n", "<3f4"), ("v1", "<3f4"), ("v2", "<3f4"), ("v3", "<3f4"), ("a", "<u2")])
+        arr = np.frombuffer(data, dtype=dt, count=n)
+        return np.stack([arr["v1"], arr["v2"], arr["v3"]], axis=1)
+    # ASCII
+    verts = []
+    with open(path, "r", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("vertex"):
+                p = line.split()
+                verts.append((float(p[1]), float(p[2]), float(p[3])))
+    verts = np.array(verts, dtype=np.float64)
+    n = len(verts) // 3
+    return verts[:n * 3].reshape(n, 3, 3)
+
+
+def analyze_supports(path, scale=1.0):
+    tris = _load_stl_triangles(path).astype(np.float64) * scale
+    if tris.shape[0] == 0:
+        return {"supports_recommended": False, "overhang_area_fraction": 0.0, "triangles": 0}
+    v1, v2, v3 = tris[:, 0, :], tris[:, 1, :], tris[:, 2, :]
+    cross = np.cross(v2 - v1, v3 - v1)
+    length = np.linalg.norm(cross, axis=1)
+    areas = 0.5 * length
+    total = areas.sum()
+    if total <= 0:
+        return {"supports_recommended": False, "overhang_area_fraction": 0.0, "triangles": int(tris.shape[0])}
+    nz = np.zeros_like(length)
+    ok = length > 1e-12
+    nz[ok] = cross[ok, 2] / length[ok]            # composante verticale de la normale
+    min_z = tris[:, :, 2].min()                    # niveau du plateau
+    tri_max_z = tris[:, :, 2].max(axis=1)
+    overhang = (nz < OVERHANG_NZ) & (tri_max_z > min_z + BED_EPS)
+    frac = float(areas[overhang].sum() / total)
+    return {
+        "supports_recommended": frac > OVERHANG_FRACTION,
+        "overhang_area_fraction": round(frac, 4),
+        "triangles": int(tris.shape[0]),
+    }
+
+
+@app.route("/analyze", methods=["POST"])
+def analyze_model():
+    """Indique si la pièce a probablement besoin de supports (analyse rapide, sans découpe)."""
+    if request.headers.get("X-API-Key") != API_KEY:
+        return jsonify(ok=False, error="cle invalide"), 401
+    if rate_limited(request.remote_addr or "?"):
+        return jsonify(ok=False, error="trop de demandes, reessaie dans un instant"), 429
+    if "file" not in request.files:
+        return jsonify(ok=False, error="aucun fichier"), 400
+    try:
+        scale = float(request.form.get("scale", "1"))
+    except ValueError:
+        scale = 1.0
+    with tempfile.TemporaryDirectory() as tmp:
+        stl_path = os.path.join(tmp, "model.stl")
+        request.files["file"].save(stl_path)
+        try:
+            res = analyze_supports(stl_path, scale)
+        except Exception:
+            return jsonify(ok=False, error="analyse impossible (STL invalide ?)"), 400
+    return jsonify(ok=True, **res)
 
 
 if __name__ == "__main__":
