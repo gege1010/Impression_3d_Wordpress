@@ -2,7 +2,7 @@
 /*
 Plugin Name: Impression 3D - Pont Slicer
 Description: Relie WordPress au service de découpe (slicer) du VPS et à WooCommerce. Calcule le prix côté serveur (poids + temps) et ajoute la commande au panier. Fonctionne aux côtés de 3DPrint Lite.
-Version: 0.4.0
+Version: 0.5.0
 Author: gege1010
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -79,7 +79,7 @@ function i3db_material_key_from_name($lite_name) {
  *  APPEL AU SLICER + CALCUL DU PRIX
  * ===================================================================== */
 
-function i3db_call_slicer($stl_path, $fields) {
+function i3db_call_slicer($stl_path, $fields, $endpoint = '/slice') {
     $base = rtrim(i3db_get('slicer_url', 'http://127.0.0.1:8099'), '/');
     $key  = i3db_get('api_key', '');
 
@@ -96,7 +96,7 @@ function i3db_call_slicer($stl_path, $fields) {
     $body .= file_get_contents($stl_path) . "\r\n";
     $body .= "--$boundary--\r\n";
 
-    $resp = wp_remote_post($base . '/slice', array(
+    $resp = wp_remote_post($base . $endpoint, array(
         'timeout' => 200,
         'headers' => array('X-API-Key' => $key, 'Content-Type' => "multipart/form-data; boundary=$boundary"),
         'body'    => $body,
@@ -110,6 +110,22 @@ function i3db_call_slicer($stl_path, $fields) {
         return new WP_Error('slicer', 'Slicer (HTTP ' . intval($code) . ') : ' . $msg);
     }
     return $data;
+}
+
+/* ---------------------------------------------------------------------
+ *  Analyse "supports" appelée par le formulaire (juste après l'upload)
+ * ------------------------------------------------------------------- */
+add_action('wp_ajax_i3db_analyze', 'i3db_ajax_analyze');
+add_action('wp_ajax_nopriv_i3db_analyze', 'i3db_ajax_analyze');
+function i3db_ajax_analyze() {
+    $model = isset($_POST['model']) ? basename(sanitize_file_name($_POST['model'])) : '';
+    if ($model === '') wp_send_json(array('ok' => false));
+    $upload = wp_upload_dir();
+    $stl = $upload['basedir'] . '/p3d/' . $model;
+    if (!file_exists($stl)) wp_send_json(array('ok' => false));
+    $res = i3db_call_slicer($stl, array('scale' => '1'), '/analyze');
+    if (is_wp_error($res)) wp_send_json(array('ok' => false));
+    wp_send_json(array('ok' => true, 'supports' => !empty($res['supports_recommended'])));
 }
 
 /** Calcule un devis complet pour un fichier. Renvoie un tableau ou un WP_Error. */
@@ -412,6 +428,7 @@ add_filter('gettext', function ($translated, $text, $domain) {
 
 // Case "supports", masquage e-mail/commentaire, et style propre.
 add_action('wp_footer', function () {
+    $ajax = esc_url(admin_url('admin-ajax.php'));
     ?>
     <style>
     form.p3dlite_form .price-request-field { display:block; width:100%; max-width:340px; margin:8px 0; padding:10px 12px; border:1px solid #d9d9d9; border-radius:8px; box-sizing:border-box; }
@@ -419,19 +436,55 @@ add_action('wp_footer', function () {
     form.p3dlite_form input[name="p3dlite_request_comment"] { display:none !important; }
     form.p3dlite_form .i3db-supports { display:flex; align-items:center; gap:8px; margin:14px 0; font-size:15px; cursor:pointer; }
     form.p3dlite_form button[type="submit"].button.alt { float:none !important; width:100%; max-width:340px; padding:14px 18px; font-size:16px; font-weight:600; border:0; border-radius:10px; cursor:pointer; }
+    #i3db-support-note { display:none; max-width:340px; margin:10px 0; padding:10px 12px; border-radius:8px; font-size:14px; line-height:1.4; }
+    #i3db-support-note.warn { background:#fff4e5; border:1px solid #ffce85; color:#7a4b00; }
+    #i3db-support-note.ok   { background:#eef7ee; border:1px solid #bcdcb8; color:#2f5d2a; }
     </style>
     <script>
     (function () {
+        var AJAX = "<?php echo $ajax; ?>";
+        var lastModel = '';
+
+        function note(needed) {
+            var form = document.querySelector('form.p3dlite_form');
+            if (!form) return;
+            var n = document.getElementById('i3db-support-note');
+            if (!n) {
+                n = document.createElement('div');
+                n.id = 'i3db-support-note';
+                var sup = form.querySelector('.i3db-supports');
+                if (sup) { sup.parentNode.insertBefore(n, sup); } else { form.appendChild(n); }
+            }
+            n.style.display = 'block';
+            if (needed) {
+                n.className = 'warn';
+                n.textContent = "\u26A0 Cette piece presente des surplombs : des supports sont recommandes (case cochee automatiquement, vous pouvez la decocher).";
+                var box = document.querySelector('[name="i3db_supports"]');
+                if (box) box.checked = true;
+            } else {
+                n.className = 'ok';
+                n.textContent = "\u2713 Cette piece ne necessite a priori pas de supports.";
+            }
+        }
+
+        function analyze(model) {
+            var data = new FormData();
+            data.append('action', 'i3db_analyze');
+            data.append('model', model);
+            fetch(AJAX, { method: 'POST', body: data, credentials: 'same-origin' })
+                .then(function (r) { return r.json(); })
+                .then(function (j) { if (j && j.ok) note(!!j.supports); })
+                .catch(function () {});
+        }
+
         var tries = 0;
         var iv = setInterval(function () {
             var form = document.querySelector('form.p3dlite_form');
             var btn  = form ? form.querySelector('button[type="submit"]') : null;
             if (form && btn) {
                 clearInterval(iv);
-                // Pré-remplit l'e-mail (masqué) pour ne pas bloquer l'envoi, puis on l'ignore côté serveur.
                 var em = form.querySelector('[name="p3dlite_email_address"]');
                 if (em && !em.value) em.value = 'panier@impression3d.local';
-                // Ajoute la case supports juste avant le bouton.
                 if (!form.querySelector('[name="i3db_supports"]')) {
                     var lbl = document.createElement('label');
                     lbl.className = 'i3db-supports';
@@ -441,6 +494,15 @@ add_action('wp_footer', function () {
             }
             if (++tries > 40) clearInterval(iv);
         }, 250);
+
+        // Surveille le fichier uploade : quand il change, on lance l'analyse.
+        setInterval(function () {
+            var mf = document.getElementById('pa_p3dlite_model');
+            if (mf && mf.value && mf.value !== lastModel) {
+                lastModel = mf.value;
+                analyze(mf.value);
+            }
+        }, 1000);
     })();
     </script>
     <?php
