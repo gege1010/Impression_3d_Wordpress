@@ -46,36 +46,36 @@ Poids exact (géométrie × densité). Temps PrusaSlicer à calibrer pour les Ba
 
 ## Avancement
 
-- [x] VPS Debian 12, accès root (terminal SSH via Plesk).
-- [x] Docker installé et fonctionnel.
-- [x] Image Docker du slicer (PrusaSlicer, paquet Debian `prusa-slicer`).
-- [x] Découpe validée : STL -> poids + temps.
-- [x] **Service de découpe (slicer API)** opérationnel sur le VPS :
+- ✅ VPS Debian 12, accès root (terminal SSH via Plesk).
+- ✅ Docker installé et fonctionnel.
+- ✅ Image Docker du slicer (PrusaSlicer, paquet Debian `prusa-slicer`).
+- ✅ Découpe validée : STL -> poids + temps.
+- ✅ **Service de découpe (slicer API)** opérationnel sur le VPS :
       reçoit STL + paramètres, renvoie JSON (poids, temps, dimensions, fits).
       Protégé par clé secrète, limite anti-abus, délai max par découpe.
-- [x] Contrôle "la pièce rentre" (boîte / cylindre) intégré au service.
-- [x] Options remplissage (infill) et supports prises en charge par le service.
-- [x] Accès au service : WordPress et slicer sur le MÊME VPS -> appel direct en 127.0.0.1 (ni domaine ni HTTPS nécessaires).
-- [ ] Vérifier le redémarrage auto du conteneur au reboot : docker update --restart unless-stopped slicer-api
-- [ ] Profils fins par machine (vitesses) + calibration du temps (time_factor).
-- [x] Pont WordPress (plugin maison) : prix recalculé côté serveur -> panier WooCommerce.
-- [x] Interface front : 3DPrint Lite 2.1.4 (upload + viewer + choix machine) + page avec [3dprint-lite].
-- [x] PARCOURS CLIENT COMPLET VALIDÉ : upload -> devis -> panier WooCommerce au bon prix.
+- ✅ Contrôle "la pièce rentre" (boîte / cylindre) intégré au service.
+- ✅ Options remplissage (infill) et supports prises en charge par le service.
+- ✅ Accès au service : WordPress et slicer sur le MÊME VPS -> appel direct en 127.0.0.1 (ni domaine ni HTTPS nécessaires).
+- ✅ Redémarrage auto du conteneur au reboot (--restart unless-stopped).
+- ⬜ Profils de vitesse propres à chaque imprimante (optionnel, pour affiner encore les estimations).
+- ✅ Pont WordPress (plugin maison) : prix recalculé côté serveur -> panier WooCommerce.
+- ✅ Interface front : 3DPrint Lite 2.1.4 (upload + viewer + choix machine) + page avec [3dprint-lite].
+- ✅ PARCOURS CLIENT COMPLET VALIDÉ : upload -> devis -> panier WooCommerce au bon prix.
 
 ## Reste à affiner (améliorations, non bloquantes)
 
-- [ ] Gestion de l'échelle (scale) si le client redimensionne (actuellement figé à 1).
-- [x] Case à cocher "supports" sur le formulaire client (pont v0.4).
-- [x] Bouton renommé "Ajouter au panier", champs e-mail/commentaire masqués, style épuré (pont v0.4).
-- [x] Détection automatique des supports : analyse géométrique des surplombs (endpoint /analyze), message + case cochée auto sur le formulaire (pont v0.5).
-- [ ] Aligner le prix AFFICHÉ sur le formulaire Lite avec le prix réel (panier).
-- [ ] Calibrer le temps des Bambu (time_factor) avec de vraies impressions.
-- [ ] Tester un vrai paiement (tunnel WooCommerce de bout en bout).
-- [ ] Option : fusionner les deux plugins en un seul (finition, plus tard).
+- ⬜ Gestion de l'échelle (scale) si le client redimensionne (actuellement figé à 1).
+- ✅ Case à cocher "supports" sur le formulaire client (pont v0.4).
+- ✅ Bouton renommé "Ajouter au panier", champs e-mail/commentaire masqués, style épuré (pont v0.4).
+- ✅ Détection automatique des supports : analyse géométrique des surplombs (endpoint /analyze), message + case cochée auto sur le formulaire (pont v0.5).
+- ⬜ Aligner le prix AFFICHÉ sur le formulaire Lite avec le prix réel (panier).
+- ✅ Mécanisme de calibration du temps par machine (coefficient réglable dans l'admin, pont v0.6). Reste à saisir les vraies valeurs après impressions de test.
+- ⬜ Tester un vrai paiement (tunnel WooCommerce de bout en bout).
+- ⬜ Option : fusionner les deux plugins en un seul (finition, plus tard).
 
 ## Versions
 
-- Pont WordPress (plugin maison `impression-3d-bridge`) : **v0.5.0**.
+- Pont WordPress (plugin maison `impression-3d-bridge`) : **v0.6.0**.
 - Service slicer (`app.py`) : endpoints /health, /slice, /analyze (détection des supports). Nécessite numpy.
 
 ## Le service de découpe (slicer API)
