@@ -2,7 +2,7 @@
 /*
 Plugin Name: Impression 3D - Pont Slicer
 Description: Relie WordPress au service de découpe (slicer) du VPS et à WooCommerce. Calcule le prix côté serveur (poids + temps) et ajoute la commande au panier. Fonctionne aux côtés de 3DPrint Lite.
-Version: 0.5.0
+Version: 0.6.0
 Author: gege1010
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -49,6 +49,17 @@ function i3db_machine_rate($printer) {
         'v400' => floatval(i3db_get('rate_v400', '1.5')),
     );
     return isset($map[$printer]) ? $map[$printer] : 0.0;
+}
+
+/** Coefficient de temps par machine (calibration). 1.0 = pas de correction. */
+function i3db_time_factor($printer) {
+    $map = array(
+        'a1'   => floatval(i3db_get('tf_a1', '1.0')),
+        'p1s'  => floatval(i3db_get('tf_p1s', '1.0')),
+        'v400' => floatval(i3db_get('tf_v400', '1.0')),
+    );
+    $f = isset($map[$printer]) ? $map[$printer] : 1.0;
+    return $f > 0 ? $f : 1.0;
 }
 
 /* =====================================================================
@@ -147,7 +158,8 @@ function i3db_quote($stl_path, $printer, $material_key, $infill, $supports, $sca
 
     $base_fee      = floatval(i3db_get('base_fee', '0'));
     $cost_material = $data['weight_g'] * $mat['price_g'];
-    $cost_time     = $data['print_time_hours'] * i3db_machine_rate($printer);
+    $hours         = $data['print_time_hours'] * i3db_time_factor($printer);
+    $cost_time     = $hours * i3db_machine_rate($printer);
     $price         = $cost_material + $cost_time + $base_fee;
 
     return array(
@@ -156,7 +168,7 @@ function i3db_quote($stl_path, $printer, $material_key, $infill, $supports, $sca
         'cost_time'     => round($cost_time, 2),
         'base_fee'      => round($base_fee, 2),
         'weight_g'      => $data['weight_g'],
-        'hours'         => $data['print_time_hours'],
+        'hours'         => round($hours, 3),
         'fits'          => $data['fits'],
         'dimensions_mm' => $data['dimensions_mm'],
         'material'      => $mat['name'],
@@ -340,6 +352,9 @@ function i3db_render_page() {
         $o['rate_a1']    = sanitize_text_field($_POST['rate_a1']);
         $o['rate_p1s']   = sanitize_text_field($_POST['rate_p1s']);
         $o['rate_v400']  = sanitize_text_field($_POST['rate_v400']);
+        $o['tf_a1']      = sanitize_text_field($_POST['tf_a1']);
+        $o['tf_p1s']     = sanitize_text_field($_POST['tf_p1s']);
+        $o['tf_v400']    = sanitize_text_field($_POST['tf_v400']);
         update_option('i3db_settings', $o);
         $notice = 'Réglages enregistrés.';
     }
@@ -385,6 +400,7 @@ function i3db_render_page() {
                 <tr><th>Clé secrète</th><td><input type="text" name="api_key" value="<?php echo esc_attr($api_key); ?>" class="regular-text"></td></tr>
                 <tr><th>Matériaux</th><td><textarea name="materials" rows="4" class="large-text" style="font-family:monospace"><?php echo esc_textarea($materials); ?></textarea><p class="description"><code>cle|Nom|densité|prix_au_gramme</code> (le Nom doit se retrouver dans le nom du matériau côté 3DPrint Lite)</p></td></tr>
                 <tr><th>Prix horaire (€/h)</th><td>A1 : <input type="text" name="rate_a1" value="<?php echo esc_attr(i3db_get('rate_a1','1.5')); ?>" size="6"> P1S : <input type="text" name="rate_p1s" value="<?php echo esc_attr(i3db_get('rate_p1s','1.5')); ?>" size="6"> V400 : <input type="text" name="rate_v400" value="<?php echo esc_attr(i3db_get('rate_v400','1.5')); ?>" size="6"></td></tr>
+                <tr><th>Coefficient de temps<br><span style="font-weight:normal;font-size:11px">(calibration : temps réel ÷ temps estimé. 1 = aucune correction)</span></th><td>A1 : <input type="text" name="tf_a1" value="<?php echo esc_attr(i3db_get('tf_a1','1.0')); ?>" size="6"> P1S : <input type="text" name="tf_p1s" value="<?php echo esc_attr(i3db_get('tf_p1s','1.0')); ?>" size="6"> V400 : <input type="text" name="tf_v400" value="<?php echo esc_attr(i3db_get('tf_v400','1.0')); ?>" size="6"></td></tr>
                 <tr><th>Forfait de base (€)</th><td><input type="text" name="base_fee" value="<?php echo esc_attr($base_fee); ?>" size="6"></td></tr>
             </table>
             <p><button type="submit" name="i3db_save" class="button button-primary">Enregistrer</button></p>
