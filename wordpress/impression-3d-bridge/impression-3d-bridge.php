@@ -2,7 +2,7 @@
 /*
 Plugin Name: Impression 3D - Pont Slicer
 Description: Relie WordPress au service de découpe (slicer) du VPS et à WooCommerce. Calcule le prix côté serveur (poids + temps) et ajoute la commande au panier. Fonctionne aux côtés de 3DPrint Lite.
-Version: 0.6.0
+Version: 0.7.1
 Author: gege1010
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -11,6 +11,9 @@ License URI: https://www.gnu.org/licenses/gpl-2.0.html
 if (!defined('ABSPATH')) {
     exit;
 }
+
+// Repère de build interne (la version reste 0.7.0 jusqu'à la 1.0 finale).
+define('I3DB_BUILD', '0.7.1 — prix accéléré + supports verrouillés (requis/conseillé)');
 
 /* =====================================================================
  *  RÉGLAGES
@@ -136,7 +139,56 @@ function i3db_ajax_analyze() {
     if (!file_exists($stl)) wp_send_json(array('ok' => false));
     $res = i3db_call_slicer($stl, array('scale' => '1'), '/analyze');
     if (is_wp_error($res)) wp_send_json(array('ok' => false));
-    wp_send_json(array('ok' => true, 'supports' => !empty($res['supports_recommended'])));
+    // Niveau selon la gravité du surplomb (fraction de surface en surplomb).
+    $frac = isset($res['overhang_area_fraction']) ? (float) $res['overhang_area_fraction'] : 0.0;
+    if ($frac > 0.06)     { $tier = 'required'; }     // surplomb important -> supports verrouillés
+    elseif ($frac > 0.02) { $tier = 'recommended'; }  // surplomb léger -> conseillés (décochables)
+    else                  { $tier = 'none'; }
+    wp_send_json(array('ok' => true, 'tier' => $tier, 'fraction' => round($frac, 4)));
+}
+
+/* ---------------------------------------------------------------------
+ *  Prix détaillé en direct sur le formulaire (sans et avec supports)
+ * ------------------------------------------------------------------- */
+add_action('wp_ajax_i3db_price', 'i3db_ajax_price');
+add_action('wp_ajax_nopriv_i3db_price', 'i3db_ajax_price');
+function i3db_ajax_price() {
+    $model       = isset($_POST['model']) ? basename(sanitize_file_name($_POST['model'])) : '';
+    $printer_id  = isset($_POST['printer'])  ? (int) $_POST['printer']  : 0;
+    $material_id = isset($_POST['material']) ? (int) $_POST['material'] : 0;
+    $infill_id   = isset($_POST['infill'])   ? (int) $_POST['infill']   : 0;
+    $scale       = isset($_POST['scale']) ? (float) $_POST['scale'] : 1.0;
+    if ($scale <= 0) $scale = 1.0;
+    if ($model === '' || !function_exists('p3dlite_get_option')) wp_send_json(array('ok' => false));
+
+    $upload = wp_upload_dir();
+    $stl = $upload['basedir'] . '/p3d/' . $model;
+    if (!file_exists($stl)) wp_send_json(array('ok' => false));
+
+    $printers  = p3dlite_get_option('p3dlite_printers');
+    $materials = p3dlite_get_option('p3dlite_materials');
+    $infills   = p3dlite_get_option('p3dlite_infills');
+    $printer_name  = isset($printers[$printer_id]['name'])  ? $printers[$printer_id]['name']  : '';
+    $material_name = isset($materials[$material_id]['name']) ? $materials[$material_id]['name'] : '';
+    $infill_pct    = isset($infills[$infill_id]['infill'])   ? (int) round($infills[$infill_id]['infill']) : 100;
+    $machine_key  = i3db_printer_key($printer_name);
+    $material_key = i3db_material_key_from_name($material_name);
+    if (!$machine_key || !$material_key) wp_send_json(array('ok' => false));
+
+    // Une seule découpe, pour l'état "supports" demandé (base OU avec supports).
+    $supports = !empty($_POST['supports']);
+    $q = i3db_quote($stl, $machine_key, $material_key, $infill_pct, $supports, $scale);
+    if (is_wp_error($q)) wp_send_json(array('ok' => false, 'error' => $q->get_error_message()));
+    wp_send_json(array(
+        'ok'       => true,
+        'supports' => $supports ? 1 : 0,
+        'fits'     => (bool) $q['fits'],
+        'material' => $q['cost_material'],
+        'time'     => $q['cost_time'],
+        'base'     => $q['base_fee'],
+        'total'    => $q['price'],
+        'sym'      => html_entity_decode(get_woocommerce_currency_symbol()),
+    ));
 }
 
 /** Calcule un devis complet pour un fichier. Renvoie un tableau ou un WP_Error. */
@@ -248,8 +300,12 @@ function i3db_process_to_cart() {
     // Supports demandés par le client (case ajoutée par notre pont)
     $supports = !empty($_POST['i3db_supports']);
 
-    // Calcul (échelle = 1 pour l'instant)
-    $q = i3db_quote($stl_path, $machine_key, $material_key, $infill_pct, $supports, 1);
+    // Échelle choisie (multiplicateur déjà prêt côté Lite : 1 = 100 %, 25.4 si pouces).
+    $scale = isset($_POST['p3dlite_resize_scale']) ? (float) $_POST['p3dlite_resize_scale'] : 1.0;
+    if ($scale <= 0) $scale = 1.0;
+
+    // Calcul (au prix réel, échelle comprise)
+    $q = i3db_quote($stl_path, $machine_key, $material_key, $infill_pct, $supports, $scale);
     if (is_wp_error($q)) { i3db_cart_error($q->get_error_message()); return; }
     if (empty($q['fits'])) { i3db_cart_error('Le modèle ne rentre pas dans la machine choisie (' . $printer_name . ').'); return; }
     if ($q['price'] <= 0)  { i3db_cart_error('Prix calculé nul, vérifie tes tarifs.'); return; }
@@ -331,6 +387,81 @@ add_action('before_woocommerce_init', function () {
 });
 
 /* =====================================================================
+ *  CONSERVATION DU FICHIER STL PAR COMMANDE + LIEN DE TÉLÉCHARGEMENT
+ * ===================================================================== */
+
+/** Copie le STL d'une commande dans un dossier protégé rangé par n° de commande. */
+function i3db_store_order_file($order_id, $filename) {
+    $upload = wp_upload_dir();
+    $src = $upload['basedir'] . '/p3d/' . $filename;
+    if (!file_exists($src)) return false;
+    $base = $upload['basedir'] . '/i3db-orders';
+    $dir  = $base . '/' . intval($order_id);
+    if (!file_exists($dir)) wp_mkdir_p($dir);
+    // Garde-fou : interdit l'accès direct au dossier (si serveur Apache).
+    $ht = $base . '/.htaccess';
+    if (!file_exists($ht)) @file_put_contents($ht, "Require all denied\n");
+    $dest = $dir . '/' . $filename;
+    if (!file_exists($dest)) @copy($src, $dest);
+    return file_exists($dest);
+}
+
+/** À la création de la commande, copie le(s) fichier(s) et marque la ligne. */
+function i3db_save_order_files($order_id, $order = null) {
+    if (!$order) $order = wc_get_order($order_id);
+    if (!$order) return;
+    foreach ($order->get_items() as $item) {
+        $file = $item->get_meta('Fichier');
+        if (!$file) continue;
+        if (i3db_store_order_file($order_id, $file)) {
+            $item->update_meta_data('_i3db_file', $file);
+            $item->save();
+        }
+    }
+}
+// Checkout classique
+add_action('woocommerce_checkout_order_processed', function ($order_id, $posted, $order) {
+    i3db_save_order_files($order_id, $order);
+}, 20, 3);
+// Checkout en blocs (Store API)
+add_action('woocommerce_store_api_checkout_order_processed', function ($order) {
+    i3db_save_order_files($order->get_id(), $order);
+}, 20, 1);
+
+/** Bouton "Télécharger le STL" sous la ligne de commande, côté admin. */
+add_action('woocommerce_after_order_itemmeta', function ($item_id, $item, $product) {
+    if (!is_a($item, 'WC_Order_Item_Product')) return;
+    $file = $item->get_meta('_i3db_file');
+    if (!$file) return;
+    $order_id = $item->get_order_id();
+    $url = wp_nonce_url(
+        admin_url('admin-post.php?action=i3db_download&order=' . $order_id . '&file=' . rawurlencode($file)),
+        'i3db_dl_' . $order_id
+    );
+    echo '<p style="margin:6px 0"><a href="' . esc_url($url) . '" class="button">⬇ Télécharger le STL</a></p>';
+}, 10, 3);
+
+/** Téléchargement sécurisé (réservé aux gestionnaires de la boutique). */
+add_action('admin_post_i3db_download', function () {
+    if (!current_user_can('manage_woocommerce')) wp_die('Accès refusé.');
+    $order_id = isset($_GET['order']) ? intval($_GET['order']) : 0;
+    $file     = isset($_GET['file']) ? basename(sanitize_file_name($_GET['file'])) : '';
+    $nonce    = isset($_GET['_wpnonce']) ? $_GET['_wpnonce'] : '';
+    if (!$order_id || $file === '' || !wp_verify_nonce($nonce, 'i3db_dl_' . $order_id)) {
+        wp_die('Lien invalide.');
+    }
+    $upload = wp_upload_dir();
+    $path = $upload['basedir'] . '/i3db-orders/' . $order_id . '/' . $file;
+    if (!file_exists($path)) wp_die('Fichier introuvable.');
+    nocache_headers();
+    header('Content-Type: application/octet-stream');
+    header('Content-Disposition: attachment; filename="' . $file . '"');
+    header('Content-Length: ' . filesize($path));
+    readfile($path);
+    exit;
+});
+
+/* =====================================================================
  *  PAGE D'ADMINISTRATION (réglages + tests)
  * ===================================================================== */
 
@@ -391,6 +522,7 @@ function i3db_render_page() {
     ?>
     <div class="wrap">
         <h1>Pont Impression 3D</h1>
+        <p style="color:#888;margin-top:-6px">Build : <code><?php echo esc_html(defined('I3DB_BUILD') ? I3DB_BUILD : '?'); ?></code></p>
         <?php if ($notice): ?><div class="notice notice-success"><p><?php echo esc_html($notice); ?></p></div><?php endif; ?>
         <h2>Réglages</h2>
         <form method="post">
@@ -444,81 +576,143 @@ add_filter('gettext', function ($translated, $text, $domain) {
 
 // Case "supports", masquage e-mail/commentaire, et style propre.
 add_action('wp_footer', function () {
-    $ajax = esc_url(admin_url('admin-ajax.php'));
     ?>
     <style>
     form.p3dlite_form .price-request-field { display:block; width:100%; max-width:340px; margin:8px 0; padding:10px 12px; border:1px solid #d9d9d9; border-radius:8px; box-sizing:border-box; }
     form.p3dlite_form input[name="p3dlite_email_address"],
     form.p3dlite_form input[name="p3dlite_request_comment"] { display:none !important; }
+    #price-wrapper, #price-container { display:none !important; }
     form.p3dlite_form .i3db-supports { display:flex; align-items:center; gap:8px; margin:14px 0; font-size:15px; cursor:pointer; }
+    form.p3dlite_form .i3db-supports input:disabled { cursor:not-allowed; }
+    form.p3dlite_form .i3db-supports input:disabled + span { color:#8a8a8a; }
     form.p3dlite_form button[type="submit"].button.alt { float:none !important; width:100%; max-width:340px; padding:14px 18px; font-size:16px; font-weight:600; border:0; border-radius:10px; cursor:pointer; }
     #i3db-support-note { display:none; max-width:340px; margin:10px 0; padding:10px 12px; border-radius:8px; font-size:14px; line-height:1.4; }
     #i3db-support-note.warn { background:#fff4e5; border:1px solid #ffce85; color:#7a4b00; }
     #i3db-support-note.ok   { background:#eef7ee; border:1px solid #bcdcb8; color:#2f5d2a; }
+    #i3db-price { display:none; max-width:340px; margin:14px 0; border:1px solid #e2e2e2; border-radius:10px; padding:14px 16px; background:#fafafa; }
+    #i3db-price .i3db-title { font-weight:700; margin-bottom:10px; font-size:15px; }
+    #i3db-price .i3db-line { display:flex; justify-content:space-between; padding:4px 0; font-size:14px; }
+    #i3db-price .i3db-line.muted { color:#9a9a9a; }
+    #i3db-price .i3db-line.total { border-top:1px solid #ddd; margin-top:8px; padding-top:8px; font-weight:700; font-size:17px; }
+    #i3db-price .i3db-loading { color:#666; font-size:14px; }
+    #i3db-price .i3db-warn { color:#9a3b00; font-size:14px; }
     </style>
     <script>
     (function () {
-        var AJAX = "<?php echo $ajax; ?>";
-        var lastModel = '';
+        var AJAX = "<?php echo esc_url(admin_url('admin-ajax.php')); ?>";
+        var lastModel='', curCfg='', base=null, withs=null, sym='\u20AC', priceCache={};
 
-        function note(needed) {
-            var form = document.querySelector('form.p3dlite_form');
-            if (!form) return;
-            var n = document.getElementById('i3db-support-note');
-            if (!n) {
-                n = document.createElement('div');
-                n.id = 'i3db-support-note';
-                var sup = form.querySelector('.i3db-supports');
-                if (sup) { sup.parentNode.insertBefore(n, sup); } else { form.appendChild(n); }
-            }
-            n.style.display = 'block';
-            if (needed) {
-                n.className = 'warn';
-                n.textContent = "\u26A0 Cette piece presente des surplombs : des supports sont recommandes (case cochee automatiquement, vous pouvez la decocher).";
-                var box = document.querySelector('[name="i3db_supports"]');
-                if (box) box.checked = true;
+        function q(n){ var e=document.querySelector('form.p3dlite_form [name="'+n+'"]'); return e?e.value:''; }
+        function supOn(){ var b=document.querySelector('.i3db-box'); return b?b.checked:false; }
+        function money(v,s){ return (Math.round(v*100)/100).toFixed(2)+' '+s; }
+        function row(l,v,c){ return '<div class="i3db-line '+(c||'')+'"><span>'+l+'</span><span>'+v+'</span></div>'; }
+
+        // ---------- Niveau de supports (requis / conseillé / aucun) ----------
+        function ensureNote(){
+            var form=document.querySelector('form.p3dlite_form'); if(!form) return null;
+            var n=document.getElementById('i3db-support-note');
+            if(!n){ n=document.createElement('div'); n.id='i3db-support-note';
+                var sup=form.querySelector('.i3db-supports');
+                if(sup) sup.parentNode.insertBefore(n,sup); else form.appendChild(n); }
+            n.style.display='block'; return n;
+        }
+        function addHidden(form){ if(document.getElementById('i3db-sup-hidden'))return;
+            var h=document.createElement('input'); h.type='hidden'; h.id='i3db-sup-hidden'; h.name='i3db_supports'; h.value='1'; form.appendChild(h); }
+        function removeHidden(){ var h=document.getElementById('i3db-sup-hidden'); if(h) h.parentNode.removeChild(h); }
+        function applyTier(tier){
+            var box=document.querySelector('.i3db-box'); if(!box) return;
+            var form=document.querySelector('form.p3dlite_form'); var n=ensureNote(); removeHidden();
+            if(tier==='required'){
+                box.checked=true; box.disabled=true; addHidden(form);
+                n.className='warn'; n.textContent="\u26A0 Supports requis : cette piece presente des surplombs importants. Ils sont inclus automatiquement.";
+            } else if(tier==='recommended'){
+                box.checked=true; box.disabled=false;
+                n.className='warn'; n.textContent="\u26A0 Supports fortement conseilles : cette piece presente des surplombs. Vous pouvez les retirer, a vos risques.";
             } else {
-                n.className = 'ok';
-                n.textContent = "\u2713 Cette piece ne necessite a priori pas de supports.";
+                box.checked=false; box.disabled=false;
+                n.className='ok'; n.textContent="\u2713 Supports non necessaires pour cette piece.";
             }
+            renderPrice();
+        }
+        function analyze(model){
+            var d=new FormData(); d.append('action','i3db_analyze'); d.append('model',model);
+            fetch(AJAX,{method:'POST',body:d,credentials:'same-origin'}).then(function(r){return r.json();})
+                .then(function(j){ if(j&&j.ok) applyTier(j.tier); }).catch(function(){});
         }
 
-        function analyze(model) {
-            var data = new FormData();
-            data.append('action', 'i3db_analyze');
-            data.append('model', model);
-            fetch(AJAX, { method: 'POST', body: data, credentials: 'same-origin' })
-                .then(function (r) { return r.json(); })
-                .then(function (j) { if (j && j.ok) note(!!j.supports); })
-                .catch(function () {});
+        // ---------- Prix (base d'abord, supports en arriere-plan) ----------
+        function cfg(){
+            var model=q('attribute_pa_p3dlite_model'), printer=q('attribute_pa_p3dlite_printer'),
+                material=q('attribute_pa_p3dlite_material'), infill=q('attribute_pa_p3dlite_infill'),
+                scale=q('p3dlite_resize_scale')||'1';
+            if(!model||!printer||!material) return null;
+            return {model:model,printer:printer,material:material,infill:infill,scale:scale,
+                    key:model+'|'+printer+'|'+material+'|'+infill+'|'+scale};
+        }
+        function fetchState(c,sup,cb){
+            var ck=c.key+'|s'+sup; if(priceCache[ck]){ cb(priceCache[ck]); return; }
+            var d=new FormData(); d.append('action','i3db_price'); d.append('model',c.model);
+            d.append('printer',c.printer); d.append('material',c.material); d.append('infill',c.infill);
+            d.append('scale',c.scale); d.append('supports',sup);
+            fetch(AJAX,{method:'POST',body:d,credentials:'same-origin'}).then(function(r){return r.json();})
+                .then(function(j){ priceCache[ck]=j; cb(j); }).catch(function(){ cb(null); });
+        }
+        function showLoading(){ var box=document.getElementById('i3db-price'); if(box){ box.style.display='block';
+            box.querySelector('.i3db-body').innerHTML='<div class="i3db-loading">Calcul du prix en cours\u2026</div>'; } }
+        function updatePrice(){
+            var c=cfg(); if(!c) return;
+            if(c.key===curCfg){ renderPrice(); return; }
+            curCfg=c.key; base=null; withs=null; showLoading();
+            fetchState(c,0,function(j){ if(c.key!==curCfg) return; base=j; if(j&&j.sym) sym=j.sym; renderPrice();
+                fetchState(c,1,function(j2){ if(c.key!==curCfg) return; withs=j2; renderPrice(); }); });
+        }
+        function renderPrice(){
+            var box=document.getElementById('i3db-price'); if(!box) return;
+            var body=box.querySelector('.i3db-body'); box.style.display='block';
+            if(!base){ body.innerHTML='<div class="i3db-loading">Calcul du prix en cours\u2026</div>'; return; }
+            if(!base.ok){ body.innerHTML='<div class="i3db-warn">Devis indisponible pour cette configuration.</div>'; return; }
+            if(!base.fits){ body.innerHTML='<div class="i3db-warn">\u26A0 La piece ne rentre pas dans la machine choisie.</div>'; return; }
+            var on=supOn(), html='';
+            html+=row('Matiere', money(base.material,sym));
+            html+=row('Temps machine', money(base.time,sym));
+            if(base.base>0) html+=row('Forfait', money(base.base,sym));
+            var sup=(withs&&withs.ok)?Math.max(0,withs.total-base.total):null;
+            html+=row('Supports'+(on?'':' (si actives)'), sup===null?'\u2026':'+ '+money(sup,sym), on?'':'muted');
+            var total=(on&&withs&&withs.ok)?withs.total:base.total;
+            html+=row('Total', money(total,sym), 'total');
+            body.innerHTML=html;
         }
 
-        var tries = 0;
-        var iv = setInterval(function () {
-            var form = document.querySelector('form.p3dlite_form');
-            var btn  = form ? form.querySelector('button[type="submit"]') : null;
-            if (form && btn) {
+        // ---------- Mise en place ----------
+        var tries=0;
+        var iv=setInterval(function(){
+            var form=document.querySelector('form.p3dlite_form');
+            var btn=form?form.querySelector('button[type="submit"]'):null;
+            if(form&&btn){
                 clearInterval(iv);
-                var em = form.querySelector('[name="p3dlite_email_address"]');
-                if (em && !em.value) em.value = 'panier@impression3d.local';
-                if (!form.querySelector('[name="i3db_supports"]')) {
-                    var lbl = document.createElement('label');
-                    lbl.className = 'i3db-supports';
-                    lbl.innerHTML = '<input type="checkbox" name="i3db_supports" value="1"> <span>Ajouter des supports d\'impression (si la piece en a besoin)</span>';
-                    btn.parentNode.insertBefore(lbl, btn);
+                var em=form.querySelector('[name="p3dlite_email_address"]');
+                if(em&&!em.value) em.value='panier@impression3d.local';
+                if(!document.getElementById('i3db-price')){
+                    var pb=document.createElement('div'); pb.id='i3db-price';
+                    pb.innerHTML='<div class="i3db-title">Votre devis</div><div class="i3db-body"></div>';
+                    btn.parentNode.insertBefore(pb,btn);
+                }
+                if(!document.querySelector('.i3db-box')){
+                    var lbl=document.createElement('label'); lbl.className='i3db-supports';
+                    lbl.innerHTML='<input type="checkbox" class="i3db-box" name="i3db_supports" value="1"> <span>Ajouter des supports d\'impression (si la piece en a besoin)</span>';
+                    btn.parentNode.insertBefore(lbl,btn);
                 }
             }
-            if (++tries > 40) clearInterval(iv);
-        }, 250);
+            if(++tries>40) clearInterval(iv);
+        },250);
 
-        // Surveille le fichier uploade : quand il change, on lance l'analyse.
-        setInterval(function () {
-            var mf = document.getElementById('pa_p3dlite_model');
-            if (mf && mf.value && mf.value !== lastModel) {
-                lastModel = mf.value;
-                analyze(mf.value);
-            }
-        }, 1000);
+        document.addEventListener('change', function(e){ if(e.target&&e.target.name==='i3db_supports') renderPrice(); });
+
+        setInterval(function(){
+            var mf=document.getElementById('pa_p3dlite_model');
+            if(mf&&mf.value&&mf.value!==lastModel){ lastModel=mf.value; analyze(mf.value); }
+            updatePrice();
+        },1000);
     })();
     </script>
     <?php
