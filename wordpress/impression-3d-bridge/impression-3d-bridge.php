@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Repère de build interne (la version reste 0.7.0 jusqu'à la 1.0 finale).
-define('I3DB_BUILD', '0.7.1 — prix accéléré + supports verrouillés (requis/conseillé)');
+define('I3DB_BUILD', '0.7.1 — extrapolation échelle + debounce 2s + abort page');
 
 /* =====================================================================
  *  RÉGLAGES
@@ -180,14 +180,18 @@ function i3db_ajax_price() {
     $q = i3db_quote($stl, $machine_key, $material_key, $infill_pct, $supports, $scale);
     if (is_wp_error($q)) wp_send_json(array('ok' => false, 'error' => $q->get_error_message()));
     wp_send_json(array(
-        'ok'       => true,
-        'supports' => $supports ? 1 : 0,
-        'fits'     => (bool) $q['fits'],
-        'material' => $q['cost_material'],
-        'time'     => $q['cost_time'],
-        'base'     => $q['base_fee'],
-        'total'    => $q['price'],
-        'sym'      => html_entity_decode(get_woocommerce_currency_symbol()),
+        'ok'            => true,
+        'supports'      => $supports ? 1 : 0,
+        'fits'          => (bool) $q['fits'],
+        'material'      => $q['cost_material'],
+        'time'          => $q['cost_time'],
+        'base'          => $q['base_fee'],
+        'total'         => $q['price'],
+        'sym'           => html_entity_decode(get_woocommerce_currency_symbol()),
+        'dimensions_mm' => $q['dimensions_mm'],
+        'weight_g'      => $q['weight_g'],
+        'hours'         => $q['hours'],
+        'printer_key'   => $machine_key,
     ));
 }
 
@@ -600,14 +604,132 @@ add_action('wp_footer', function () {
     <script>
     (function () {
         var AJAX = "<?php echo esc_url(admin_url('admin-ajax.php')); ?>";
-        var lastModel='', curCfg='', base=null, withs=null, sym='\u20AC', priceCache={};
+        var sym = '\u20AC';
 
+        /* ---- State ---- */
+        var lastModel = '';
+        var curCfgKey = '';
+        var baseWithout = null;   // scale-1 result, supports OFF
+        var baseWith    = null;   // scale-1 result, supports ON
+        var debounceTimer = null;
+        var controllers   = [];   // active AbortControllers
+
+        /* ---- Build volumes (client-side fits check) ---- */
+        var BUILDS = {
+            a1:   { box: [256, 256, 256] },
+            p1s:  { box: [256, 256, 256] },
+            v400: { sq: 205, z: 390 }
+        };
+
+        /* ---- Helpers ---- */
         function q(n){ var e=document.querySelector('form.p3dlite_form [name="'+n+'"]'); return e?e.value:''; }
         function supOn(){ var b=document.querySelector('.i3db-box'); return b?b.checked:false; }
         function money(v,s){ return (Math.round(v*100)/100).toFixed(2)+' '+s; }
         function row(l,v,c){ return '<div class="i3db-line '+(c||'')+'"><span>'+l+'</span><span>'+v+'</span></div>'; }
+        function getScale(){ var s=parseFloat(q('p3dlite_resize_scale'))||1; return s>0?s:1; }
 
-        // ---------- Niveau de supports (requis / conseillé / aucun) ----------
+        /* Config key WITHOUT scale (slicer only needs machine/mat/infill/model) */
+        function cfgKey(){
+            var model=q('attribute_pa_p3dlite_model'), printer=q('attribute_pa_p3dlite_printer'),
+                material=q('attribute_pa_p3dlite_material'), infill=q('attribute_pa_p3dlite_infill');
+            if(!model||!printer||!material) return null;
+            return {model:model,printer:printer,material:material,infill:infill,
+                    key:model+'|'+printer+'|'+material+'|'+infill};
+        }
+
+        /* ---- Client-side fits check ---- */
+        function checkFits(dims, pk){
+            var b=BUILDS[pk]; if(!b) return false;
+            if(b.box){
+                var d=dims.slice().sort(function(a,b){return b-a;});
+                var v=b.box.slice().sort(function(a,b){return b-a;});
+                return d[0]<=v[0] && d[1]<=v[1] && d[2]<=v[2];
+            }
+            return Math.max(dims[0],dims[1])<=b.sq && dims[2]<=b.z;
+        }
+
+        /* ---- Scale extrapolation (math, no slicer call) ---- */
+        function extrapolate(base, scale){
+            if(!base||!base.ok) return base;
+            var s3=scale*scale*scale;
+            var dims=base.dimensions_mm.map(function(d){return d*scale;});
+            return {
+                ok:true,
+                fits:checkFits(dims, base.printer_key),
+                material: Math.round(base.material*s3*100)/100,
+                time:     Math.round(base.time*s3*100)/100,
+                base:     base.base,
+                total:    Math.round((base.material*s3 + base.time*s3 + base.base)*100)/100
+            };
+        }
+
+        /* ---- Abort all in-flight requests ---- */
+        function abortAll(){
+            controllers.forEach(function(c){ try{c.abort();}catch(e){} });
+            controllers=[];
+        }
+
+        /* ---- Fetch from slicer (always scale=1) ---- */
+        function fetchBase(c, sup, cb){
+            var ctrl=new AbortController(); controllers.push(ctrl);
+            var d=new FormData();
+            d.append('action','i3db_price'); d.append('model',c.model);
+            d.append('printer',c.printer);   d.append('material',c.material);
+            d.append('infill',c.infill);     d.append('scale','1');
+            d.append('supports',sup);
+            fetch(AJAX,{method:'POST',body:d,credentials:'same-origin',signal:ctrl.signal})
+                .then(function(r){return r.json();})
+                .then(function(j){cb(j);})
+                .catch(function(e){ if(e.name!=='AbortError') cb(null); });
+        }
+
+        /* ---- Loading indicator ---- */
+        function showLoading(){
+            var box=document.getElementById('i3db-price');
+            if(box){ box.style.display='block';
+                box.querySelector('.i3db-body').innerHTML='<div class="i3db-loading">Calcul du prix en cours\u2026</div>'; }
+        }
+
+        /* ---- Trigger slicer (one call at scale 1, supports off then on) ---- */
+        function triggerSlice(){
+            var c=cfgKey(); if(!c) return;
+            if(c.key===curCfgKey && baseWithout){ renderPrice(); return; }
+            curCfgKey=c.key; baseWithout=null; baseWith=null;
+            abortAll(); showLoading();
+            var saved=c.key;
+            fetchBase(c, 0, function(j){
+                if(saved!==curCfgKey) return;
+                baseWithout=j; if(j&&j.sym) sym=j.sym;
+                renderPrice();
+                fetchBase(c, 1, function(j2){
+                    if(saved!==curCfgKey) return;
+                    baseWith=j2; renderPrice();
+                });
+            });
+        }
+
+        /* ---- Render price (extrapolated to current scale) ---- */
+        function renderPrice(){
+            var box=document.getElementById('i3db-price'); if(!box) return;
+            var body=box.querySelector('.i3db-body'); box.style.display='block';
+            var scale=getScale();
+            var data=baseWithout ? extrapolate(baseWithout, scale) : null;
+            if(!data){ body.innerHTML='<div class="i3db-loading">Calcul du prix en cours\u2026</div>'; return; }
+            if(!data.ok){ body.innerHTML='<div class="i3db-warn">Devis indisponible pour cette configuration.</div>'; return; }
+            if(!data.fits){ body.innerHTML='<div class="i3db-warn">\u26A0 La pi\u00e8ce ne rentre pas dans la machine choisie.</div>'; return; }
+            var on=supOn(), html='';
+            html+=row('Mati\u00e8re', money(data.material,sym));
+            html+=row('Temps machine', money(data.time,sym));
+            if(data.base>0) html+=row('Forfait', money(data.base,sym));
+            var supData=baseWith ? extrapolate(baseWith, scale) : null;
+            var supCost=(supData&&supData.ok)?Math.max(0,supData.total-data.total):null;
+            html+=row('Supports'+(on?'':' (si activ\u00e9s)'), supCost===null?'\u2026':'+ '+money(supCost,sym), on?'':'muted');
+            var total=(on&&supData&&supData.ok)?supData.total:data.total;
+            html+=row('Total', money(total,sym), 'total');
+            body.innerHTML=html;
+        }
+
+        /* ---- Support tier analysis (unchanged) ---- */
         function ensureNote(){
             var form=document.querySelector('form.p3dlite_form'); if(!form) return null;
             var n=document.getElementById('i3db-support-note');
@@ -624,66 +746,33 @@ add_action('wp_footer', function () {
             var form=document.querySelector('form.p3dlite_form'); var n=ensureNote(); removeHidden();
             if(tier==='required'){
                 box.checked=true; box.disabled=true; addHidden(form);
-                n.className='warn'; n.textContent="\u26A0 Supports requis : cette piece presente des surplombs importants. Ils sont inclus automatiquement.";
+                n.className='warn'; n.textContent="\u26A0 Supports requis : cette pi\u00e8ce pr\u00e9sente des surplombs importants. Ils sont inclus automatiquement.";
             } else if(tier==='recommended'){
                 box.checked=true; box.disabled=false;
-                n.className='warn'; n.textContent="\u26A0 Supports fortement conseilles : cette piece presente des surplombs. Vous pouvez les retirer, a vos risques.";
+                n.className='warn'; n.textContent="\u26A0 Supports fortement conseill\u00e9s : cette pi\u00e8ce pr\u00e9sente des surplombs. Vous pouvez les retirer, \u00e0 vos risques.";
             } else {
                 box.checked=false; box.disabled=false;
-                n.className='ok'; n.textContent="\u2713 Supports non necessaires pour cette piece.";
+                n.className='ok'; n.textContent="\u2713 Supports non n\u00e9cessaires pour cette pi\u00e8ce.";
             }
             renderPrice();
         }
         function analyze(model){
+            var ctrl=new AbortController(); controllers.push(ctrl);
             var d=new FormData(); d.append('action','i3db_analyze'); d.append('model',model);
-            fetch(AJAX,{method:'POST',body:d,credentials:'same-origin'}).then(function(r){return r.json();})
-                .then(function(j){ if(j&&j.ok) applyTier(j.tier); }).catch(function(){});
+            fetch(AJAX,{method:'POST',body:d,credentials:'same-origin',signal:ctrl.signal})
+                .then(function(r){return r.json();})
+                .then(function(j){ if(j&&j.ok) applyTier(j.tier); })
+                .catch(function(){});
         }
 
-        // ---------- Prix (base d'abord, supports en arriere-plan) ----------
-        function cfg(){
-            var model=q('attribute_pa_p3dlite_model'), printer=q('attribute_pa_p3dlite_printer'),
-                material=q('attribute_pa_p3dlite_material'), infill=q('attribute_pa_p3dlite_infill'),
-                scale=q('p3dlite_resize_scale')||'1';
-            if(!model||!printer||!material) return null;
-            return {model:model,printer:printer,material:material,infill:infill,scale:scale,
-                    key:model+'|'+printer+'|'+material+'|'+infill+'|'+scale};
-        }
-        function fetchState(c,sup,cb){
-            var ck=c.key+'|s'+sup; if(priceCache[ck]){ cb(priceCache[ck]); return; }
-            var d=new FormData(); d.append('action','i3db_price'); d.append('model',c.model);
-            d.append('printer',c.printer); d.append('material',c.material); d.append('infill',c.infill);
-            d.append('scale',c.scale); d.append('supports',sup);
-            fetch(AJAX,{method:'POST',body:d,credentials:'same-origin'}).then(function(r){return r.json();})
-                .then(function(j){ priceCache[ck]=j; cb(j); }).catch(function(){ cb(null); });
-        }
-        function showLoading(){ var box=document.getElementById('i3db-price'); if(box){ box.style.display='block';
-            box.querySelector('.i3db-body').innerHTML='<div class="i3db-loading">Calcul du prix en cours\u2026</div>'; } }
-        function updatePrice(){
-            var c=cfg(); if(!c) return;
-            if(c.key===curCfg){ renderPrice(); return; }
-            curCfg=c.key; base=null; withs=null; showLoading();
-            fetchState(c,0,function(j){ if(c.key!==curCfg) return; base=j; if(j&&j.sym) sym=j.sym; renderPrice();
-                fetchState(c,1,function(j2){ if(c.key!==curCfg) return; withs=j2; renderPrice(); }); });
-        }
-        function renderPrice(){
-            var box=document.getElementById('i3db-price'); if(!box) return;
-            var body=box.querySelector('.i3db-body'); box.style.display='block';
-            if(!base){ body.innerHTML='<div class="i3db-loading">Calcul du prix en cours\u2026</div>'; return; }
-            if(!base.ok){ body.innerHTML='<div class="i3db-warn">Devis indisponible pour cette configuration.</div>'; return; }
-            if(!base.fits){ body.innerHTML='<div class="i3db-warn">\u26A0 La piece ne rentre pas dans la machine choisie.</div>'; return; }
-            var on=supOn(), html='';
-            html+=row('Matiere', money(base.material,sym));
-            html+=row('Temps machine', money(base.time,sym));
-            if(base.base>0) html+=row('Forfait', money(base.base,sym));
-            var sup=(withs&&withs.ok)?Math.max(0,withs.total-base.total):null;
-            html+=row('Supports'+(on?'':' (si actives)'), sup===null?'\u2026':'+ '+money(sup,sym), on?'':'muted');
-            var total=(on&&withs&&withs.ok)?withs.total:base.total;
-            html+=row('Total', money(total,sym), 'total');
-            body.innerHTML=html;
+        /* ---- Debounced config change handler ---- */
+        function onConfigChange(){
+            clearTimeout(debounceTimer);
+            showLoading();
+            debounceTimer=setTimeout(triggerSlice, 2000);
         }
 
-        // ---------- Mise en place ----------
+        /* ---- DOM setup (wait for 3DPrint Lite form) ---- */
         var tries=0;
         var iv=setInterval(function(){
             var form=document.querySelector('form.p3dlite_form');
@@ -699,20 +788,43 @@ add_action('wp_footer', function () {
                 }
                 if(!document.querySelector('.i3db-box')){
                     var lbl=document.createElement('label'); lbl.className='i3db-supports';
-                    lbl.innerHTML='<input type="checkbox" class="i3db-box" name="i3db_supports" value="1"> <span>Ajouter des supports d\'impression (si la piece en a besoin)</span>';
+                    lbl.innerHTML='<input type="checkbox" class="i3db-box" name="i3db_supports" value="1"> <span>Ajouter des supports d\'impression (si la pi\u00e8ce en a besoin)</span>';
                     btn.parentNode.insertBefore(lbl,btn);
                 }
+
+                /* Event listeners: config changes -> debounce 2s */
+                ['attribute_pa_p3dlite_printer','attribute_pa_p3dlite_material','attribute_pa_p3dlite_infill'].forEach(function(name){
+                    var el=form.querySelector('[name="'+name+'"]');
+                    if(el) el.addEventListener('change', onConfigChange);
+                });
+
+                /* Scale change -> instant recalc (no slicer call) */
+                var scaleEl=form.querySelector('[name="p3dlite_resize_scale"]');
+                if(scaleEl){
+                    scaleEl.addEventListener('input', renderPrice);
+                    scaleEl.addEventListener('change', renderPrice);
+                }
+
+                /* Supports checkbox -> instant recalc */
+                document.addEventListener('change', function(e){
+                    if(e.target&&e.target.name==='i3db_supports') renderPrice();
+                });
             }
             if(++tries>40) clearInterval(iv);
         },250);
 
-        document.addEventListener('change', function(e){ if(e.target&&e.target.name==='i3db_supports') renderPrice(); });
-
+        /* Model change detection (3DPrint Lite sets it via JS, must poll) */
         setInterval(function(){
             var mf=document.getElementById('pa_p3dlite_model');
-            if(mf&&mf.value&&mf.value!==lastModel){ lastModel=mf.value; analyze(mf.value); }
-            updatePrice();
+            if(mf&&mf.value&&mf.value!==lastModel){
+                lastModel=mf.value;
+                analyze(mf.value);
+                onConfigChange();
+            }
         },1000);
+
+        /* ---- Abort everything if user leaves the page ---- */
+        window.addEventListener('beforeunload', abortAll);
     })();
     </script>
     <?php
