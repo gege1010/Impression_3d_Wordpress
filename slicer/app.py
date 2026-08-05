@@ -49,6 +49,40 @@ MACHINES = {
     "v400": {"name": "FLSUN V400",    "shape": "cylinder", "diameter": 300,      "z": 410, "time_factor": 1.0},
 }
 
+# --- Géométrie du plateau transmise à PrusaSlicer -------------------------
+# IMPORTANT : sans ces réglages, PrusaSlicer utilise sa machine par défaut
+# (plateau 200 x 200, hauteur 200) et REFUSE de découper toute pièce plus
+# grande, avec "Objects could not fit on the bed". C'était la cause des
+# "Devis indisponible" sur les grandes pièces.
+#
+# PrusaSlicer décrit le plateau par une liste de points "XxY". Un plateau
+# rond (delta) est donc un polygone à N points répartis sur le cercle.
+CIRCLE_POINTS = 72
+
+
+def _round_bed(diameter, points=CIRCLE_POINTS):
+    """Plateau circulaire -> polygone, posé dans le quadrant positif."""
+    r = diameter / 2.0
+    return ",".join(
+        "%.2fx%.2f" % (r + r * math.cos(2 * math.pi * i / points),
+                       r + r * math.sin(2 * math.pi * i / points))
+        for i in range(points)
+    )
+
+
+def _square_bed(x, y):
+    """Plateau rectangulaire -> les 4 coins."""
+    return "0x0,%gx0,%gx%g,0x%g" % (x, x, y, y)
+
+
+for _key, _m in MACHINES.items():
+    if _m["shape"] == "cylinder":
+        _m["bed_shape"] = _round_bed(_m["diameter"])
+        _m["center"] = "%g,%g" % (_m["diameter"] / 2.0, _m["diameter"] / 2.0)
+    else:
+        _m["bed_shape"] = _square_bed(_m["x"], _m["y"])
+        _m["center"] = "%g,%g" % (_m["x"] / 2.0, _m["y"] / 2.0)
+
 # --- Petit garde-fou anti-abus --------------------------------------------
 # On limite le nombre de demandes par adresse IP sur une fenêtre de temps,
 # pour qu'un plaisantin qui envoie 30 fichiers ne sature pas le serveur.
@@ -94,7 +128,13 @@ def model_dimensions(stl_path, scale):
 def fits_in_machine(machine, sx, sy, sz):
     """Vérifie si la pièce rentre dans la machine.
     - boîte    : on essaie les deux orientations à plat.
-    - cylindre : l'empreinte au sol doit tenir dans le cercle (diagonale <= diamètre)."""
+    - cylindre : l'empreinte au sol doit tenir dans le cercle (diagonale <= diamètre).
+
+    C'est le SEUL contrôle de taille qui fait foi. On ne peut pas s'appuyer sur
+    PrusaSlicer : dès qu'on lui passe un --center explicite il ne vérifie plus
+    rien (mesuré : il accepte 310 mm de large sur un plateau de 300, et 420 mm
+    de haut pour une limite à 410), et sans --center il ne teste que la boîte
+    englobante du plateau, jamais le cercle."""
     if machine["shape"] == "box":
         footprint_ok = (sx <= machine["x"] and sy <= machine["y"]) or \
                        (sx <= machine["y"] and sy <= machine["x"])
@@ -106,8 +146,18 @@ def fits_in_machine(machine, sx, sy, sz):
 
 @app.route("/health")
 def health():
-    """Petite page pour vérifier que le service répond."""
-    return jsonify(ok=True, service="slicer", machines=list(MACHINES.keys()))
+    """Petite page pour vérifier que le service répond.
+    On y expose l'enveloppe de chaque machine : ça permet de contrôler d'un
+    coup d'oeil, depuis l'extérieur, que le service tourne bien avec les bonnes
+    dimensions (et pas la machine par défaut de PrusaSlicer)."""
+    envelopes = {}
+    for key, m in MACHINES.items():
+        if m["shape"] == "cylinder":
+            envelopes[key] = {"shape": "cylinder", "diameter_mm": m["diameter"], "height_mm": m["z"]}
+        else:
+            envelopes[key] = {"shape": "box", "x_mm": m["x"], "y_mm": m["y"], "height_mm": m["z"]}
+    return jsonify(ok=True, service="slicer",
+                   machines=list(MACHINES.keys()), build_volumes=envelopes)
 
 
 @app.route("/slice", methods=["POST"])
@@ -154,9 +204,34 @@ def slice_model():
             return jsonify(ok=False, error="fichier illisible (STL invalide ?)"), 400
         fits = fits_in_machine(machine, sx, sy, sz)
 
+        # 6 bis) Hors enveloppe : on ne découpe pas du tout.
+        # Inutile (et lent) de faire travailler PrusaSlicer sur une pièce qui
+        # ne rentrera pas ; on répond tout de suite avec fits=false, et le site
+        # affiche "la pièce ne rentre pas" au lieu d'un devis fantaisiste.
+        if not fits:
+            return jsonify(
+                ok=True,
+                printer=machine["name"],
+                weight_g=0.0,
+                print_time_seconds=0,
+                print_time_hours=0.0,
+                dimensions_mm=[round(sx, 1), round(sy, 1), round(sz, 1)],
+                volume_cm3=round(volume_mm3 / 1000.0, 2),
+                fits=False,
+                infill_percent=infill,
+                supports=supports,
+            )
+
         # 7) Construire la commande de découpe
         cmd = [
             "prusa-slicer", "--export-gcode", stl_path, "--output", gcode_path,
+            # Géométrie de la machine choisie. Sans ça, PrusaSlicer découpe sur
+            # un plateau 200x200x200 et refuse tout ce qui dépasse.
+            "--bed-shape", machine["bed_shape"],
+            "--max-print-height", str(machine["z"]),
+            # On pose la pièce au centre du plateau : elle est déjà validée par
+            # fits_in_machine(), donc PrusaSlicer n'a plus qu'à la découper.
+            "--center", machine["center"],
             "--nozzle-diameter", nozzle,
             "--layer-height", layer_height, "--first-layer-height", layer_height,
             "--filament-diameter", "1.75",

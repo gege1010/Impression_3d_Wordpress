@@ -2,7 +2,7 @@
 /*
 Plugin Name: Impression 3D - Pont Slicer
 Description: Relie WordPress au service de découpe (slicer) du VPS et à WooCommerce. Calcule le prix côté serveur (poids + temps) et ajoute la commande au panier. Fonctionne aux côtés de 3DPrint Lite.
-Version: 0.7.1
+Version: 0.7.2
 Author: gege1010
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Repère de build interne (la version reste 0.7.0 jusqu'à la 1.0 finale).
-define('I3DB_BUILD', '0.7.1 — extrapolation échelle + debounce 2s + abort page');
+define('I3DB_BUILD', '0.7.2 — enveloppes machine réelles (V400 Ø300x410, Bambu 256) alignées sur le slicer');
 
 /* =====================================================================
  *  RÉGLAGES
@@ -614,11 +614,14 @@ add_action('wp_footer', function () {
         var debounceTimer = null;
         var controllers   = [];   // active AbortControllers
 
-        /* ---- Build volumes (client-side fits check) ---- */
+        /* ---- Enveloppes machine ----
+           Doivent rester identiques au dictionnaire MACHINES de slicer/app.py :
+           mêmes dimensions ET même règle de contrôle, sinon le site et le
+           service de découpe se contredisent. */
         var BUILDS = {
-            a1:   { box: [256, 256, 256] },
-            p1s:  { box: [256, 256, 256] },
-            v400: { sq: 205, z: 390 }
+            a1:   { box: [256, 256], z: 256 },
+            p1s:  { box: [256, 256], z: 256 },
+            v400: { diameter: 300,   z: 410 }
         };
 
         /* ---- Helpers ---- */
@@ -637,15 +640,21 @@ add_action('wp_footer', function () {
                     key:model+'|'+printer+'|'+material+'|'+infill};
         }
 
-        /* ---- Client-side fits check ---- */
+        /* ---- Contrôle "ça rentre" ----
+           Reproduit exactement fits_in_machine() côté serveur :
+           - plateau rectangulaire : l'empreinte tient à plat, dans un sens ou
+             dans l'autre (on ne couche pas la pièce, la hauteur reste la hauteur) ;
+           - plateau rond (delta)  : la diagonale de l'empreinte tient dans le
+             cercle. C'est bien la diagonale, pas le plus grand côté : une pièce
+             de 280 x 80 passe sur un plateau de 300 (diagonale 291). */
         function checkFits(dims, pk){
             var b=BUILDS[pk]; if(!b) return false;
+            if(dims[2] > b.z) return false;
             if(b.box){
-                var d=dims.slice().sort(function(a,b){return b-a;});
-                var v=b.box.slice().sort(function(a,b){return b-a;});
-                return d[0]<=v[0] && d[1]<=v[1] && d[2]<=v[2];
+                return (dims[0]<=b.box[0] && dims[1]<=b.box[1]) ||
+                       (dims[0]<=b.box[1] && dims[1]<=b.box[0]);
             }
-            return Math.max(dims[0],dims[1])<=b.sq && dims[2]<=b.z;
+            return Math.sqrt(dims[0]*dims[0] + dims[1]*dims[1]) <= b.diameter;
         }
 
         /* ---- Scale extrapolation (math, no slicer call) ---- */
@@ -655,7 +664,9 @@ add_action('wp_footer', function () {
             var dims=base.dimensions_mm.map(function(d){return d*scale;});
             return {
                 ok:true,
-                fits:checkFits(dims, base.printer_key),
+                /* À l'échelle 1, c'est le verdict du serveur qui fait foi ;
+                   au-delà on refait le calcul avec la même règle. */
+                fits: (scale===1) ? !!base.fits : checkFits(dims, base.printer_key),
                 material: Math.round(base.material*s3*100)/100,
                 time:     Math.round(base.time*s3*100)/100,
                 base:     base.base,
