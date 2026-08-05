@@ -83,6 +83,133 @@ for _key, _m in MACHINES.items():
         _m["bed_shape"] = _square_bed(_m["x"], _m["y"])
         _m["center"] = "%g,%g" % (_m["x"] / 2.0, _m["y"] / 2.0)
 
+
+# --- Vitesses et accélérations par machine --------------------------------
+# Sans ces réglages, PrusaSlicer chronomètre TOUTES les machines avec ses
+# valeurs génériques (périmètre 60, remplissage 80, déplacement 130 mm/s) :
+# le temps estimé — donc le prix — était surévalué d'un facteur 3 à 4.
+#
+# Les valeurs ci-dessous sont reprises telles quelles des profils publiés par
+# les fabricants, pas inventées :
+#   - FLSUN V400 : profil PrusaSlicer officiel de FLSUN, section [print:*V400*]
+#     de resources/profiles/FLSun.ini dans github.com/Flsun3d/FlsunSlicer
+#     (FlsunSlicer est un fork de PrusaSlicer, donc les noms d'options sont
+#     déjà les bons).
+#   - Bambu A1 / P1S : profils officiels de Bambu Studio
+#     (github.com/bambulab/BambuStudio, resources/profiles/BBL), couche
+#     0,2 mm, buse 0,4 — noms d'options traduits vers ceux de PrusaSlicer.
+#
+# Depuis le passage de l'image à Debian trixie (PrusaSlicer 2.9.2), toutes les
+# accélérations par type de trajet et les vitesses de surplomb dynamiques du
+# profil FLSUN sont reprises. Seule reste sans équivalent travel_speed_first_layer.
+# ⚠️ Ne pas revenir à une base bookworm (PrusaSlicer 2.5) sans retirer ces
+# options : la 2.5 les refuse et la découpe échouerait.
+MACHINE_PROFILES = {
+    # Bambu Lab A1 — vitesses communes aux Bambu, accélération plus douce.
+    "a1": {
+        "external-perimeter-speed": "200", "perimeter-speed": "300",
+        "small-perimeter-speed": "50%", "infill-speed": "270",
+        "solid-infill-speed": "250", "top-solid-infill-speed": "200",
+        "gap-fill-speed": "250", "bridge-speed": "50",
+        "support-material-speed": "150", "first-layer-speed": "50",
+        "travel-speed": "700", "max-print-speed": "500",
+        "default-acceleration": "6000", "perimeter-acceleration": "5000",
+        "infill-acceleration": "6000", "first-layer-acceleration": "500",
+        "external-perimeter-acceleration": "5000",
+        "top-solid-infill-acceleration": "2000",
+        "machine-max-acceleration-extruding": "12000,12000",
+        "machine-max-acceleration-x": "12000,12000",
+        "machine-max-acceleration-y": "12000,12000",
+        "machine-max-acceleration-travel": "9000,9000",
+        "machine-max-feedrate-x": "500,500", "machine-max-feedrate-y": "500,500",
+        "machine-max-jerk-x": "9,9", "machine-max-jerk-y": "9,9",
+    },
+    # Bambu Lab P1S — mêmes vitesses que l'A1, machine plus nerveuse.
+    "p1s": {
+        "external-perimeter-speed": "200", "perimeter-speed": "300",
+        "small-perimeter-speed": "50%", "infill-speed": "270",
+        "solid-infill-speed": "250", "top-solid-infill-speed": "200",
+        "gap-fill-speed": "250", "bridge-speed": "50",
+        "support-material-speed": "150", "first-layer-speed": "50",
+        "travel-speed": "500", "max-print-speed": "500",
+        "default-acceleration": "10000", "perimeter-acceleration": "5000",
+        "infill-acceleration": "10000", "first-layer-acceleration": "500",
+        "external-perimeter-acceleration": "5000",
+        "top-solid-infill-acceleration": "2000",
+        "travel-acceleration": "10000",
+        "machine-max-acceleration-extruding": "20000,20000",
+        "machine-max-acceleration-x": "20000,20000",
+        "machine-max-acceleration-y": "20000,20000",
+        "machine-max-acceleration-travel": "9000,9000",
+        "machine-max-feedrate-x": "500,500", "machine-max-feedrate-y": "500,500",
+        "machine-max-jerk-x": "9,9", "machine-max-jerk-y": "9,9",
+    },
+    # FLSUN V400 — delta, nettement plus rapide (remplissage à 550 mm/s).
+    "v400": {
+        "external-perimeter-speed": "180", "perimeter-speed": "230",
+        "small-perimeter-speed": "230", "infill-speed": "550",
+        "solid-infill-speed": "350", "top-solid-infill-speed": "250",
+        "gap-fill-speed": "100", "bridge-speed": "30",
+        "support-material-speed": "400", "first-layer-speed": "100",
+        "travel-speed": "600", "max-print-speed": "600",
+        "default-acceleration": "10000", "perimeter-acceleration": "5000",
+        "infill-acceleration": "10000", "bridge-acceleration": "5000",
+        "first-layer-acceleration": "5000",
+        "external-perimeter-acceleration": "5000",
+        "solid-infill-acceleration": "8000",
+        "top-solid-infill-acceleration": "8000",
+        "travel-acceleration": "10000",
+        # Ralentissements dans les surplombs, selon la part de la trajectoire
+        # qui repose dans le vide. Sans effet sur une pièce sans surplomb.
+        # None = drapeau sans valeur : lui passer "1" ferait prendre ce 1 pour
+        # un nom de fichier et la découpe échouerait ("No such file: 1").
+        "enable-dynamic-overhang-speeds": None,
+        "overhang-speed-0": "30", "overhang-speed-1": "60",
+        "overhang-speed-2": "80", "overhang-speed-3": "120",
+        "machine-max-acceleration-extruding": "10000,1250",
+        "machine-max-acceleration-x": "30000,1000",
+        "machine-max-acceleration-y": "30000,1000",
+        "machine-max-feedrate-x": "10000,200", "machine-max-feedrate-y": "10000,200",
+        "machine-max-jerk-x": "20000,10", "machine-max-jerk-y": "20000,10",
+    },
+}
+
+# Débit maximum de matière, en mm³/s. C'est le vrai plafond physique : une
+# buse ne peut pas fondre plus vite que ça, quelle que soit la vitesse
+# demandée. 0 = pas de plafond.
+#   - Bambu publie 21 mm³/s pour son PLA (profil filament officiel) : repris tel quel.
+#   - FLSUN laisse le champ à 0, donc aucun plafond.
+#
+# ⚠️ SEULE VALEUR DE CE FICHIER QUI NE VIENT PAS D'UNE SOURCE OFFICIELLE : les
+# 25 mm³/s de la V400. Le profil FLSUN ne plafonne rien tout en demandant
+# 550 mm/s de remplissage, ce qui représente ~49 mm³/s en couche de 0,2 mm —
+# aucune buse de 0,4 ne fond aussi vite. Suivre FLSUN à la lettre sous-estime
+# donc le temps, et fait SOUS-FACTURER. 25 mm³/s correspond à une buse haute
+# fusion 0,4, ce que la V400 embarque. Effet mesuré sur un cube de 100 mm :
+# 1 h 41 sans plafond, 2 h 10 à 25 mm³/s (+29 %).
+# À remplacer dès qu'une impression réelle chronométrée permet de trancher.
+MAX_VOLUMETRIC = {"a1": "21", "p1s": "21", "v400": "25"}
+
+# ⚠️ Mesuré, contre-intuitif : PrusaSlicer 2.5 n'applique les limites machine
+# au calcul du temps QUE pour les saveurs Marlin. En saveur "reprap" (le
+# défaut), il ignore les accélérations qu'on lui passe et retombe sur sa
+# valeur interne de 1500 mm/s². Même configuration, même pièce : 3 h 31 en
+# reprap contre 2 h 30 en marlin2. Le G-code ne sert qu'à lire le poids et le
+# temps — il n'est jamais envoyé à une imprimante — donc la saveur est sans
+# conséquence par ailleurs. FLSUN utilise "klipper", qui n'existe pas encore
+# dans la 2.5 : marlin2 est l'équivalent le plus proche qui honore les limites.
+GCODE_FLAVOR = "marlin2"
+
+
+def profile_args(printer_key):
+    """Traduit le profil d'une machine en options de ligne de commande."""
+    args = ["--gcode-flavor", GCODE_FLAVOR]
+    for option, value in MACHINE_PROFILES[printer_key].items():
+        # Valeur None = option booléenne, qui s'active sans argument.
+        args += ["--" + option] if value is None else ["--" + option, value]
+    args += ["--filament-max-volumetric-speed", MAX_VOLUMETRIC[printer_key]]
+    return args
+
 # --- Petit garde-fou anti-abus --------------------------------------------
 # On limite le nombre de demandes par adresse IP sur une fenêtre de temps,
 # pour qu'un plaisantin qui envoie 30 fichiers ne sature pas le serveur.
@@ -241,6 +368,8 @@ def slice_model():
             "--skirts", "1",
             "--filament-density", density,
         ]
+        # Vitesses, accélérations et limites propres à la machine choisie.
+        cmd += profile_args(printer)
         if supports:
             cmd += ["--support-material"]
         if scale != 1.0:
