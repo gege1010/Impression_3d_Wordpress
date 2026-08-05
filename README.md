@@ -180,6 +180,7 @@ Le prix final au panier est toujours recalculé côté serveur (slicer réel ave
 
 - **Pont WordPress** (`impression-3d-bridge`) : **v0.7.2** — build : `enveloppes machine réelles (V400 Ø300x410, Bambu 256) alignées sur le slicer`.
 - **Service slicer** (`app.py`) : endpoints `/health`, `/slice`, `/analyze`. Stack : Flask + gunicorn (2 workers, timeout 200s) + numpy.
+- **Image du slicer** : base `debian:trixie-slim` (Debian 13) → **PrusaSlicer 2.9.2**, Python 3.13, numpy 2.x. Migrée depuis `bookworm-slim` (PrusaSlicer 2.5.0, figée en 2022) en 08/2026 : le service fait analyser des STL déposés par n'importe quel visiteur, il ne doit pas rester sur une version qui ne reçoit plus de correctifs.
 
 ---
 
@@ -270,17 +271,62 @@ curl -s -H "X-API-Key: ta-cle-secrete" \
 
 ### Mettre à jour le slicer (VPS)
 
+⚠️ **Ne jamais taper la clé secrète dans la commande.** Tout ce qu'on tape est journalisé
+(historique du shell, transcriptions d'outils), et une clé écrite une fois y reste. La mise à
+jour n'en a pas besoin : on récupère celle du conteneur déjà en place, dans une variable, sans
+jamais l'afficher.
+
 ```bash
 cd ~/slicer
 curl -fL -o app.py https://raw.githubusercontent.com/gege1010/Impression_3d_Wordpress/main/slicer/app.py
 curl -fL -o Dockerfile https://raw.githubusercontent.com/gege1010/Impression_3d_Wordpress/main/slicer/Dockerfile
-docker build -t slicer-api .
-docker rm -f slicer-api
+
+# Filets de sécurité : on garde de quoi revenir en arrière.
+cp app.py app.py.avant-$(date +%Y%m%d)
+docker tag slicer-api:latest slicer-api:avant-$(date +%Y%m%d)
+
+docker build -t slicer-api:latest .
+
+# Récupération de la clé en place. Le --format ciblé est délibéré :
+# un « docker inspect » nu déverse tout l'environnement en clair.
+KEY=$(docker inspect slicer-api --format '{{range .Config.Env}}{{println .}}{{end}}' \
+      | grep '^SLICER_API_KEY=' | cut -d= -f2-)
+[ -n "$KEY" ] || { echo "ABANDON : clé introuvable, ne pas continuer"; exit 1; }
+
+docker stop slicer-api && docker rm slicer-api
 docker run -d --name slicer-api --restart unless-stopped \
   -p 127.0.0.1:8099:8099 \
-  -e SLICER_API_KEY=<CLE> slicer-api
+  -e SLICER_API_KEY="$KEY" slicer-api:latest
+unset KEY
+
 curl -s http://127.0.0.1:8099/health
 ```
+
+Le `/health` doit répondre `ok: true` **et** afficher les bonnes enveloppes dans
+`build_volumes` — c'est le contrôle qui prouve que le conteneur tourne bien avec la nouvelle
+version, et pas avec la machine par défaut de PrusaSlicer.
+
+Retour arrière si besoin : `docker rm -f slicer-api`, puis le même `docker run` en remplaçant
+`slicer-api:latest` par le tag `slicer-api:avant-<date>`.
+
+#### Première installation, ou changement de clé
+
+Là seulement, il faut fournir une nouvelle clé — et toujours **par un fichier**, jamais en
+argument :
+
+```bash
+# Générer la clé et l'écrire directement dans un fichier (elle ne s'affiche jamais).
+umask 077 && openssl rand -hex 32 > ~/slicer/.env.key
+
+docker run -d --name slicer-api --restart unless-stopped \
+  -p 127.0.0.1:8099:8099 \
+  --env-file <(printf 'SLICER_API_KEY=%s\n' "$(cat ~/slicer/.env.key)") \
+  slicer-api:latest
+```
+
+Puis coller la même valeur dans **admin WP → Réglages → Pont Impression 3D → Clé secrète**
+(`cat ~/slicer/.env.key` pour la lire au moment de la copie). ⚠️ C'est un secret partagé :
+tant que les deux côtés ne portent pas la même valeur, les devis renvoient `cle invalide` (401).
 
 ### Synchroniser le dépôt GitHub
 
