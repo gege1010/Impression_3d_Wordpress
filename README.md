@@ -69,7 +69,15 @@ limitée à 30 devis/mois) et aucune dépendance externe.
 | Bambu Lab P1S    | FDM       | `p1s`      | 256 × 256 × 256 mm (boîte) | 0,4mm |
 | FLSUN V400       | FDM delta | `v400`     | cylindre Ø300 × 410 mm      | 0,4mm |
 
-Contrôle « ça rentre » : boîte pour les Bambu, cylindre inscrit (carré ~205 mm, h ~390 mm) pour la FLSUN.
+Contrôle « ça rentre » : pour les Bambu, l'empreinte tient à plat dans le carré, dans un sens
+ou dans l'autre. Pour la FLSUN, c'est la **diagonale de l'empreinte** qui doit tenir dans le
+cercle — pas le plus grand côté : une pièce de 280 × 80 mm passe sur un plateau de Ø300
+(diagonale 291). La hauteur reste la hauteur, on ne couche jamais la pièce.
+
+Ce contrôle est fait par `fits_in_machine()` dans `slicer/app.py`, et **c'est le seul qui fait
+foi** — voir « Le service de découpe » plus bas pour la raison. Le navigateur applique la même
+règle (`checkFits()` dans le plugin), uniquement pour l'affichage en temps réel : les deux
+doivent rester identiques.
 
 ---
 
@@ -114,7 +122,9 @@ Le prix final au panier est toujours recalculé côté serveur (slicer réel ave
 
 - ✅ Image Docker du slicer (PrusaSlicer CLI, Flask, gunicorn 2 workers, numpy).
 - ✅ Découpe validée : STL → poids + temps + dimensions + fits.
-- ✅ Contrôle « la pièce rentre » (boîte / cylindre) intégré.
+- ✅ Contrôle « la pièce rentre » (boîte / cylindre) intégré — seule autorité en matière de taille.
+- ✅ **Géométrie réelle de chaque machine transmise à PrusaSlicer** (plateau + hauteur max) : sans
+  ça il découpait sur sa machine par défaut 200 × 200 × 200 et refusait tout ce qui dépassait.
 - ✅ Options remplissage (infill) et supports prises en charge.
 - ✅ Endpoint `/analyze` : détection géométrique des surplombs (normales des facettes).
 - ✅ Protégé par clé secrète (`X-API-Key`), limite anti-abus, délai max par découpe.
@@ -132,7 +142,7 @@ Le prix final au panier est toujours recalculé côté serveur (slicer réel ave
 - ✅ **Extrapolation mathématique de l'échelle** : une seule découpe à l'échelle 1×, recalcul instantané en JS (v0.7.1).
 - ✅ **Debounce 2 secondes** : changement de machine/matériau/remplissage → attente de 2s avant découpe (v0.7.1).
 - ✅ **Annulation des requêtes** à la fermeture de page (`AbortController` + `beforeunload`) (v0.7.1).
-- ✅ **Vérification « ça rentre »** aussi côté client (volumes de construction en dur) pour l'affichage en temps réel (v0.7.1).
+- ✅ **Vérification « ça rentre »** aussi côté client (volumes de construction en dur) pour l'affichage en temps réel (v0.7.1), **alignée sur la règle du serveur** depuis la v0.7.2 — à l'échelle 1, c'est le verdict du serveur qui fait foi.
 - ✅ Coefficient de calibration du temps par machine (réglable dans l'admin).
 - ✅ Conservation du STL par commande (`wp-content/uploads/i3db-orders/<n°>/`) + bouton téléchargement admin.
 - ✅ Produit WooCommerce caché créé automatiquement, prix appliqué dynamiquement.
@@ -148,14 +158,19 @@ Le prix final au panier est toujours recalculé côté serveur (slicer réel ave
 
 ### À tester / vérifier 🔶
 
-- 🔶 Plugin v0.7.1 : livré, à tester côté client (extrapolation + debounce + abort).
+- 🔶 Plugin v0.7.2 : déployé, à tester côté client (extrapolation + debounce + abort, et grandes pièces sur les trois machines).
 - 🔶 Tester un vrai paiement (tunnel WooCommerce de bout en bout).
 - 🔶 Saisir les vraies valeurs de calibration temps après impressions de test.
 
 ### Roadmap ⬜
 
+- ⬜ **Profils de vitesse propres à chaque imprimante** — plus optionnel : c'est le dernier vrai
+  écart de précision sur les prix. La commande de découpe ne transmet aujourd'hui **aucune vitesse
+  ni accélération**, donc les trois machines sont chronométrées avec les défauts génériques de
+  PrusaSlicer (périmètre 60, remplissage 80, déplacement 130 mm/s, accél. 1500/1250) — très loin
+  d'une delta V400. Même chantier que la calibration des coefficients de temps ci-dessus : les
+  deux demandent de vraies impressions, pas des valeurs constructeur.
 - ⬜ Refonte esthétique du formulaire (panneau latéral à droite du viewer 3D, cartes modernes).
-- ⬜ Profils de vitesse propres à chaque imprimante (optionnel, pour affiner les estimations).
 - ⬜ Fusionner les deux plugins en un seul (finition, plus tard).
 - ⬜ Traduction FR de 3DPrint Lite via Loco Translate (optionnel).
 
@@ -163,7 +178,7 @@ Le prix final au panier est toujours recalculé côté serveur (slicer réel ave
 
 ## Versions
 
-- **Pont WordPress** (`impression-3d-bridge`) : **v0.7.1** — build : `extrapolation échelle + debounce 2s + abort page`.
+- **Pont WordPress** (`impression-3d-bridge`) : **v0.7.2** — build : `enveloppes machine réelles (V400 Ø300x410, Bambu 256) alignées sur le slicer`.
 - **Service slicer** (`app.py`) : endpoints `/health`, `/slice`, `/analyze`. Stack : Flask + gunicorn (2 workers, timeout 200s) + numpy.
 
 ---
@@ -187,9 +202,35 @@ Points d'entrée :
 
 | Endpoint | Méthode | Description |
 |----------|---------|-------------|
-| `/health` | GET | Vérifie que le service répond (pas de clé requise) |
+| `/health` | GET | Vérifie que le service répond (pas de clé requise) et expose l'enveloppe de chaque machine (`build_volumes`) |
 | `/slice` | POST | Découpe STL → poids, temps, dimensions, fits |
 | `/analyze` | POST | Analyse géométrique des surplombs → supports recommandés (oui/non/fraction) |
+
+### ⚠️ Il n'y a aucun profil `.ini` — la géométrie machine passe en ligne de commande
+
+Ne cherchez pas un profil PrusaSlicer à corriger, il n'en existe pas : `app.py` construit toute
+la commande en options `--`, et transmet la géométrie de la machine choisie via `--bed-shape`,
+`--max-print-height` et `--center`, à partir du dictionnaire `MACHINES`.
+
+**C'est indispensable.** Sans ces options, PrusaSlicer utilise sa machine compilée par défaut —
+plateau 200 × 200, hauteur 200 — et **refuse de découper** toute pièce plus grande, avec
+`Objects could not fit on the bed`. Le site affichait alors « Devis indisponible pour cette
+configuration ». Les trois machines étaient touchées, pas seulement la V400 (corrigé en 08/2026).
+
+Pour vérifier ce qui est réellement appliqué, les réglages sont écrits en clair dans le G-code
+produit : `grep '^; bed_shape' fichier.gcode`.
+
+**Ne comptez jamais sur PrusaSlicer pour refuser une pièce trop grande** (mesuré) : dès qu'on lui
+passe un `--center` explicite il ne valide plus rien — il accepte 310 mm de large sur un plateau
+de 300, et 420 mm de haut pour une limite à 410. Et sans `--center`, il ne teste que la **boîte
+englobante** du plateau, jamais le cercle. Le seul juge est `fits_in_machine()`.
+
+Une pièce hors enveloppe n'est donc pas découpée du tout : la réponse est `ok=true` avec
+`fits=false`, poids et temps à 0 — donc un total réduit au seul forfait. ⚠️ **Tout script de
+devis par lot doit tester `fits`**, sinon il enregistre des lignes au prix du forfait au lieu de
+signaler « pièce à découper ».
+
+### Appel
 
 En-tête : `X-API-Key: ta-cle-secrete`. Champs formulaire pour `/slice` :
 `file` (le .stl), `printer` (a1/p1s/v400), `infill` (ex. 20),
