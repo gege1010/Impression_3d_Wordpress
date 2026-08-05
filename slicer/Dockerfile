@@ -1,4 +1,10 @@
-FROM debian:bookworm-slim
+# Debian 13 "trixie" : apporte PrusaSlicer 2.9.x.
+# Bookworm gelait la 2.5.0 (2022) — or ce service fait analyser par PrusaSlicer
+# des STL deposes par n'importe quel visiteur, donc du parsing de binaire non
+# fiable expose sur Internet : rester sur une version figee n'etait pas tenable.
+# Mesure avant bascule : la 2.9.2 donne les memes estimations que la 2.5.0
+# (+2 a +4 % de temps, poids identique), les prix ne bougent donc pas.
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
       prusa-slicer python3 python3-flask python3-numpy gunicorn ca-certificates \
     && rm -rf /var/lib/apt/lists/*
